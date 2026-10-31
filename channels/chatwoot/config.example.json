@@ -1,0 +1,7 @@
+{
+  "chatwoot": {
+    "base_url": "https://chatwoot.example.com",
+    "account_id": "1",
+    "token_command": ["your-secret-tool", "CHATWOOT_TOKEN_EXAMPLE"]
+  }
+}

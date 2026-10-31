@@ -1,0 +1,4 @@
+{
+  "server": { "hostname": "bridge.example.com" },
+  "services": { "slack-bridge": { "path_prefix": "/slack" } }
+}

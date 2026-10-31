@@ -1,0 +1,100 @@
+{
+  "_note": "Every key the kit reads, with a placeholder. Copy what you need to ~/.config/comms-kit/config.json. A key you leave out turns that part off.",
+  "data_dir": "~/.local/share/comms-kit",
+  "self_emails": [
+    "you@example.com"
+  ],
+  "channel_dirs": [],
+  "ledger_dir": "~/projects/communications",
+  "not_a_repo": [
+    "~/notes"
+  ],
+  "imessage": {
+    "binary_path": "~/.local/share/comms-kit/imessage/vendor/imsg/v0.14.1/imsg",
+    "state_dir": "~/.local/share/comms-kit/imessage/state",
+    "draft_checker": "~/comms-kit/channels/whatsapp/draft_check.py"
+  },
+  "instantly": {
+    "workspaces": {
+      "my-workspace": [
+        "your-secret-tool",
+        "INSTANTLY_KEY_MY_WORKSPACE"
+      ]
+    }
+  },
+  "telegram": {
+    "api_id_command": [
+      "your-secret-tool",
+      "TELEGRAM_API_ID_EXAMPLE"
+    ],
+    "api_hash_command": [
+      "your-secret-tool",
+      "TELEGRAM_API_HASH_EXAMPLE"
+    ],
+    "session_path": "~/.config/comms-kit/telegram.session"
+  },
+  "gchat": {
+    "gws_account": ""
+  },
+  "chatwoot": {
+    "base_url": "https://chatwoot.example.com",
+    "account_id": "1",
+    "token_command": [
+      "your-secret-tool",
+      "CHATWOOT_TOKEN_EXAMPLE"
+    ]
+  },
+  "slack": {
+    "bridge_url": "https://bridge.example.com/slack",
+    "ssh_host": "my-bridge-server",
+    "vps_bridge_dir": "/srv/slack-bridge",
+    "repo_root": "~/path/to/private-workspace-with-env-and-guards",
+    "bridge_dir": "~/path/to/comms-kit/channels/slack/bridge",
+    "owner_user_id": "U0123456789",
+    "e2e_workspace": "my-own-workspace",
+    "self_dm": "D0123456789",
+    "e2e_react_ts": "1700000000.000100"
+  },
+  "whatsapp": {
+    "homeserver": "https://matrix.example.com",
+    "bot_user": "@whatsappbot:matrix.example.com",
+    "contact_names_command": "ssh matrix.example.com \"sqlite3 -readonly -json /path/to/mautrix-whatsapp.db \\\"SELECT their_jid AS jid, full_name AS name, 'synced' AS source FROM whatsmeow_contacts WHERE full_name <> ''\\\"\"",
+    "matrix_user": "owner",
+    "owner_lid": "4440100",
+    "self_number": "12065550100",
+    "self_labels": [
+      "12065550100",
+      "Alex Doe (WA)"
+    ],
+    "recipient_guard_dir": "/path/to/folder/with/outbound_guards",
+    "voice_env_file": "/path/to/voice.env",
+    "voice_id_var": "WHATSAPP_VOICE_ID",
+    "voice_id": "",
+    "voice_background": ""
+  },
+  "outbound": {
+    "dev_guard": "/path/to/your/dev_guard.py",
+    "dev_ok_env": []
+  },
+  "_external_keys": [
+    "data_dir",
+    "slack.e2e_react_ts",
+    "slack.e2e_workspace",
+    "slack.owner_user_id",
+    "slack.self_dm"
+  ],
+  "calls": {
+    "notes_db": "~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite",
+    "notes_folder": "Call Recordings",
+    "quo_key_command": [
+      "your-secret-tool",
+      "QUO_API_KEY"
+    ],
+    "litepipe_db": "~/.litepipe/db.sqlite",
+    "litepipe_apps": [
+      "FaceTime",
+      "Phone"
+    ],
+    "whisper_url": "https://whisper.example.com:8765"
+  }
+}

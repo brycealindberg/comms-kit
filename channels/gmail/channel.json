@@ -1,0 +1,81 @@
+{
+  "name": "gmail",
+  "entry": "gws",
+  "kind": "external",
+  "verbs": {
+    "+send": {
+      "direction": "send",
+      "dry_run_unless_yes": false
+    },
+    "+reply": {
+      "direction": "send",
+      "dry_run_unless_yes": false
+    },
+    "+reply-all": {
+      "direction": "send",
+      "dry_run_unless_yes": false
+    },
+    "+forward": {
+      "direction": "send",
+      "dry_run_unless_yes": false
+    },
+    "messages.send": {
+      "direction": "send",
+      "dry_run_unless_yes": false
+    },
+    "drafts.send": {
+      "direction": "send",
+      "dry_run_unless_yes": false
+    },
+    "+read": {
+      "direction": "read"
+    },
+    "+triage": {
+      "direction": "read"
+    },
+    "+watch": {
+      "direction": "read"
+    },
+    "messages.get": {
+      "direction": "read"
+    },
+    "messages.list": {
+      "direction": "read"
+    },
+    "threads.get": {
+      "direction": "read"
+    },
+    "threads.list": {
+      "direction": "read"
+    },
+    "history.list": {
+      "direction": "read"
+    },
+    "drafts.get": {
+      "direction": "read"
+    },
+    "drafts.list": {
+      "direction": "read"
+    },
+    "messages.import": {
+      "direction": "none"
+    },
+    "messages.insert": {
+      "direction": "none"
+    },
+    "drafts.create": {
+      "direction": "none"
+    },
+    "drafts.update": {
+      "direction": "none"
+    }
+  },
+  "blocked": {},
+  "config_keys": [],
+  "requires": [
+    "gws (googleworkspace/cli, Apache-2.0) on PATH",
+    "a Google OAuth client and a signed-in account created with `gws auth login`",
+    "core/bin/gws-as and core/gmail_accounts.py for several accounts"
+  ],
+  "notes": "No code here: the core tools gws-as and gmail_accounts.py choose the account. gws has two paths, the +verb helpers and raw users.* calls, and both can send real mail."
+}

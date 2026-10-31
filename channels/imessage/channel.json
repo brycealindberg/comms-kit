@@ -1,0 +1,31 @@
+{
+  "name": "imessage",
+  "entry": "imessage.py",
+  "kind": "python-cli",
+  "verbs": {
+    "chats": {"direction": "read"},
+    "resolve": {"direction": "read"},
+    "history": {"direction": "read"},
+    "search": {"direction": "read"},
+    "whois": {"direction": "read"},
+    "stats": {"direction": "read"},
+    "doctor": {"direction": "none"},
+    "prepare-send": {"direction": "none"},
+    "show-preview": {"direction": "none"},
+    "discard-preview": {"direction": "none"},
+    "send": {"direction": "send", "dry_run_unless_yes": false},
+    "send-preview": {"direction": "send", "dry_run_unless_yes": false}
+  },
+  "ignored": [],
+  "blocked": {
+    "reply-quote": "Needs System Integrity Protection off plus a private-API helper; the Messages scripting dictionary has no reply option, so a reply cannot quote a message here.",
+    "tapback": "Needs System Integrity Protection off plus a private-API helper; the only SIP-on route is UI automation, which this channel does not use.",
+    "edit": "Needs System Integrity Protection off plus a private-API helper; Messages exposes no edit verb to scripts.",
+    "unsend": "Needs System Integrity Protection off plus a private-API helper; Messages exposes no unsend verb to scripts.",
+    "mark-read": "Needs System Integrity Protection off plus a private-API helper that reaches the Messages internals; a read-only database cannot mark a message read.",
+    "group-admin": "Needs System Integrity Protection off plus a private-API helper; creating a group, adding or removing members, renaming and leaving are not scriptable with SIP on.",
+    "block": "No way on macOS: no command or script verb blocks a number; blocking is a Settings or Phone screen action only."
+  },
+  "config_keys": ["imessage.binary_path", "imessage.state_dir", "imessage.draft_checker"],
+  "requires": ["python3", "macos", "openclaw/imsg 0.14.1 (MIT) at imessage.binary_path", "Full Disk Access and Automation for the terminal running it"]
+}

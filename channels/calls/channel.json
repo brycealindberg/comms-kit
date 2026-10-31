@@ -1,0 +1,15 @@
+{
+  "name": "calls",
+  "entry": "calls.py",
+  "kind": "python-cli",
+  "verbs": {
+    "pull": {"direction": "none", "dry_run_unless_yes": true},
+    "list": {"direction": "none"},
+    "show": {"direction": "none"},
+    "doctor": {"direction": "none"}
+  },
+  "ignored": [],
+  "blocked": {},
+  "config_keys": ["calls.notes_db", "calls.notes_folder", "calls.quo_key_command", "calls.litepipe_db", "calls.litepipe_apps", "calls.whisper_url"],
+  "requires": ["python3"]
+}

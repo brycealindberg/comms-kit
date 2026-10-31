@@ -1,0 +1,18 @@
+{
+  "name": "telegram",
+  "entry": "telegram.py",
+  "kind": "python-cli",
+  "verbs": {
+    "chats": {"direction": "read"},
+    "unread": {"direction": "read"},
+    "history": {"direction": "read"},
+    "find": {"direction": "read"},
+    "send": {"direction": "send", "dry_run_unless_yes": true},
+    "reply": {"direction": "send", "dry_run_unless_yes": true},
+    "mark-read": {"direction": "none", "dry_run_unless_yes": true}
+  },
+  "ignored": ["login", "status"],
+  "blocked": {},
+  "config_keys": ["telegram.api_id_command", "telegram.api_hash_command", "telegram.session_path"],
+  "requires": ["python3", "telethon (optional, pip install telethon)"]
+}

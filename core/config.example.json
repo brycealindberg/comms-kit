@@ -1,0 +1,19 @@
+{
+  "_note": "Copy to ~/.config/comms-kit/config.json (or point COMMS_KIT_CONFIG at it) and replace each placeholder. Set a value with: python3 core/kitconfig.py set KEY VALUE",
+  "_external_keys": [
+    "data_dir"
+  ],
+  "data_dir": "~/.local/share/comms-kit",
+  "self_emails": [
+    "you@example.com"
+  ],
+  "channel_dirs": [],
+  "ledger_dir": "~/projects/communications",
+  "not_a_repo": [
+    "~/notes"
+  ],
+  "outbound": {
+    "dev_guard": "/path/to/your/dev_guard.py",
+    "dev_ok_env": []
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "slack-bridge",
+  "version": "1.0.0",
+  "description": "Slack bridge using browser session tokens — polls Web API, exposes REST endpoints",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "auth": "node auth.js",
+    "pair": "node pair.js",
+    "sync": "node sync.js",
+    "sync:dry": "node sync.js --dry-run",
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "@sentry/node": "^10.43.0",
+    "@slack/web-api": "^7.8.0",
+    "express": "^4.21.0",
+    "puppeteer": "^25.16.0"
+  }
+}

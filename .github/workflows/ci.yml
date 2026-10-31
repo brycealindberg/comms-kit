@@ -1,0 +1,41 @@
+# GitHub-hosted runners only. A public repo never runs on a self-hosted runner:
+# a pull request from a stranger would run code on that machine.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Capability table matches each channel's real CLI
+        run: python3 tools/capabilities.py --check
+      - name: Every config key is in the example file
+        run: python3 tools/check_config_keys.py
+      - name: Licenses allow release and nothing is vendored
+        run: python3 tools/check_licenses.py
+      - name: Data files stay out of the code tree
+        run: python3 tools/check_data_paths.py
+      - name: Every suite passes from a clean clone with an empty HOME
+        run: python3 tools/clean_clone_test.py

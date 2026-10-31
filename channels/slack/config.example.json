@@ -1,0 +1,13 @@
+{
+  "slack": {
+    "bridge_url": "https://bridge.example.com/slack",
+    "ssh_host": "my-bridge-server",
+    "vps_bridge_dir": "/srv/slack-bridge",
+    "repo_root": "~/path/to/private-workspace-with-env-and-guards",
+    "bridge_dir": "~/path/to/comms-kit/channels/slack/bridge",
+    "owner_user_id": "U0123456789",
+    "e2e_workspace": "my-own-workspace",
+    "self_dm": "D0123456789",
+    "e2e_react_ts": "1700000000.000100"
+  }
+}

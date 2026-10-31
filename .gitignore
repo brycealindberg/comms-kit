@@ -1,0 +1,18 @@
+# Local state and every file that can hold personal data. Never commit these.
+.unlazy/
+.env
+.env.*
+!.env.example
+config.json
+contacts.json
+routes.json
+*.jsonl
+*.db
+*.sqlite
+chrome-profile/
+sessions/
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+tmp/

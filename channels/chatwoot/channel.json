@@ -1,0 +1,19 @@
+{
+  "name": "chatwoot",
+  "entry": "chatwoot.py",
+  "kind": "python-cli",
+  "verbs": {
+    "conversations": {"direction": "read"},
+    "unread": {"direction": "read"},
+    "thread": {"direction": "read"},
+    "find": {"direction": "read"},
+    "reply": {"direction": "send", "dry_run_unless_yes": true},
+    "note": {"direction": "none", "dry_run_unless_yes": true},
+    "resolve": {"direction": "none", "dry_run_unless_yes": true},
+    "mark-read": {"direction": "none", "dry_run_unless_yes": true}
+  },
+  "ignored": [],
+  "blocked": {},
+  "config_keys": ["chatwoot.base_url", "chatwoot.account_id", "chatwoot.token_command"],
+  "requires": ["python3"]
+}

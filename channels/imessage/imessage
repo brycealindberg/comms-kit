@@ -1,0 +1,48 @@
+#!/bin/sh
+# One safe entrypoint. Headless sends, text or files; no legacy syntax, no GUI fallback.
+# The wrapper beside this file is the only backend; nothing from the environment or PATH
+# can redirect it.
+set -eu
+here=$(CDPATH= cd -- "${0%/*}" && pwd)
+SAFE="$here/imessage.py"
+
+case "${1:-}" in
+  ""|-h|--help|--version|doctor|chats|resolve|history|search|whois|stats|send|prepare-send|show-preview|send-preview|discard-preview)
+    ;;
+  *)
+    printf '%s\n' \
+      'Unsupported legacy iMessage command or option; nothing was run.' \
+      'Use: imessage --help' \
+      'Send with: imessage send --chat-id ID --text-file PATH  (headless, verified).' \
+      'Also: --file PATH for an attachment, --to HANDLE for a new recipient.' \
+      'No watch, no live inbound channel, no GUI fallback.' >&2
+    exit 64
+    ;;
+esac
+
+# The legacy upstream shape `send RECIPIENT TEXT` puts the message body in argv, where
+# `ps` and shell history can read it. Requiring a FLAG first refuses it without dictating
+# flag order. Duplicate and unknown flags are argparse's job, not this script's.
+if [ "${1:-}" = "send" ] && [ "$#" -gt 1 ]; then
+  case "${2:-}" in
+    -*)
+      ;;
+    *)
+      printf '%s\n' \
+        'Unsupported legacy iMessage command or option; nothing was run.' \
+        'Positional `send RECIPIENT TEXT` is not supported: it puts the message' \
+        'body in argv. Address the send with a flag instead.' \
+        'Use: imessage send --chat-id ID --text-file PATH' >&2
+      exit 64
+      ;;
+  esac
+fi
+
+if [ ! -f "$SAFE" ]; then
+  printf '%s\n' 'The wrapper is missing; refusing any fallback.' >&2
+  exit 69
+fi
+if [ "$#" -eq 0 ]; then
+  set -- --help
+fi
+exec /usr/bin/python3 -I "$SAFE" "$@"

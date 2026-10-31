@@ -1,0 +1,10 @@
+{
+  "calls": {
+    "notes_db": "~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite",
+    "notes_folder": "Call Recordings",
+    "quo_key_command": ["your-secret-tool", "QUO_API_KEY"],
+    "litepipe_db": "~/.litepipe/db.sqlite",
+    "litepipe_apps": ["FaceTime", "Phone"],
+    "whisper_url": "https://whisper.example.com:8765"
+  }
+}

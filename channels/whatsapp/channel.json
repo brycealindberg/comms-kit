@@ -1,0 +1,49 @@
+{
+  "name": "whatsapp",
+  "entry": "whatsapp_mautrix.py",
+  "kind": "python-cli",
+  "verbs": {
+    "search": {"direction": "read"},
+    "history": {"direction": "read"},
+    "chats": {"direction": "read"},
+    "groups": {"direction": "read"},
+    "unread": {"direction": "read"},
+    "download": {"direction": "read"},
+    "transcribe": {"direction": "read"},
+    "find": {"direction": "read"},
+    "group-members": {"direction": "read"},
+    "send": {"direction": "send", "dry_run_unless_yes": true},
+    "send-media": {"direction": "send", "dry_run_unless_yes": true},
+    "send-voice-confirm": {"direction": "send", "dry_run_unless_yes": true},
+    "reply": {"direction": "send", "dry_run_unless_yes": true},
+    "react": {"direction": "send", "dry_run_unless_yes": true},
+    "edit": {"direction": "send", "dry_run_unless_yes": true},
+    "delete": {"direction": "send", "dry_run_unless_yes": true},
+    "group-create": {"direction": "send", "dry_run_unless_yes": true},
+    "group-add": {"direction": "send", "dry_run_unless_yes": true},
+    "group-remove": {"direction": "send", "dry_run_unless_yes": true},
+    "group-rename": {"direction": "send", "dry_run_unless_yes": true},
+    "group-leave": {"direction": "send", "dry_run_unless_yes": true},
+    "block": {"direction": "send", "dry_run_unless_yes": true},
+    "mark-read": {"direction": "none", "dry_run_unless_yes": true},
+    "send-voice": {"direction": "none"}
+  },
+  "ignored": ["login", "status", "sync"],
+  "blocked": {
+    "unblock": "The mautrix-whatsapp bridge help lists block-user and no unblock, so the CLI refuses with exit 5."
+  },
+  "config_keys": [
+    "whatsapp.homeserver",
+    "whatsapp.bot_user",
+    "whatsapp.matrix_user",
+    "whatsapp.owner_lid",
+    "whatsapp.self_number",
+    "whatsapp.self_labels",
+    "whatsapp.recipient_guard_dir",
+    "whatsapp.voice_env_file",
+    "whatsapp.voice_id_var",
+    "whatsapp.voice_id",
+    "whatsapp.voice_background"
+  ],
+  "requires": ["python3", "a Matrix homeserver with mautrix-whatsapp"]
+}

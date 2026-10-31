@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""gws-as EMAIL <any gws args>  --  run gws as one ADDED Gmail account.
+
+Sets GOOGLE_WORKSPACE_CLI_CONFIG_DIR to ~/.config/gws-accounts/EMAIL and
+GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file, then runs gws with the caller's FULL environment
+(a stripped env makes gws delete its login). Plain `gws` stays the main account.
+
+Refuses: an address that is not a plain email, an account nobody added, a folder that is a
+symlink or sits outside the accounts folder, and any data call for an account that has no
+login yet (gws would fall back to gcloud's own credentials = another identity).
+`auth ...` is always allowed, so `gws-as EMAIL auth login --scopes ...` can connect it.
+
+Manage accounts with: comms gmail-account add|list|rm EMAIL
+Library: gmail_accounts.py, in the kit's core folder
+"""
+import os
+import pwd
+import sys
+
+
+
+def _core_dir():
+    """The folder holding gmail_accounts.py: COMMS_KIT_CORE, the folder above this script (the
+    repo layout, core/bin), the same through install.sh's link, then the REAL home's ~/.claude/communications (not $HOME: tests point
+    $HOME at a throwaway folder)."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # kit: code path
+    linked = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # kit: code path
+    real = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".claude", "communications")
+    for folder in (os.environ.get("COMMS_KIT_CORE"), here, linked, real):  # kit: code path
+        if folder and os.path.exists(os.path.join(folder, "gmail_accounts.py")):
+            return os.path.abspath(os.path.expanduser(folder))
+    return real
+
+
+sys.path.insert(0, _core_dir())
+import gmail_accounts as GA  # noqa: E402
+
+
+def main(argv):
+    if len(argv) < 2:
+        sys.stderr.write("usage: gws-as EMAIL <gws args>   (add one first: comms gmail-account add EMAIL)\n")
+        return 2
+    try:
+        email = GA.valid_email(argv[0])
+        GA.account_dir(email)
+        if argv[1] != "auth" and not GA.is_connected(email):
+            sys.stderr.write("gws-as: %s has no login yet. Connect it first: comms gmail-account add %s "
+                             "and run the ! line it prints.\n" % (email, email))
+            return 3
+        env = GA.child_env(email)
+    except GA.AccountError as e:
+        sys.stderr.write("gws-as: %s\n" % e)
+        return 2
+    try:
+        os.execvpe("gws", ["gws"] + argv[1:], env)
+    except OSError as e:
+        sys.stderr.write("gws-as: cannot run gws: %s\n" % e)
+        return 127
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

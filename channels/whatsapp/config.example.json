@@ -1,0 +1,16 @@
+{
+  "whatsapp": {
+    "homeserver": "https://matrix.example.com",
+    "bot_user": "@whatsappbot:matrix.example.com",
+    "contact_names_command": "ssh matrix.example.com \"sqlite3 -readonly -json /path/to/mautrix-whatsapp.db \\\"SELECT their_jid AS jid, full_name AS name, 'synced' AS source FROM whatsmeow_contacts WHERE full_name <> ''\\\"\"",
+    "matrix_user": "owner",
+    "owner_lid": "4440100",
+    "self_number": "12065550100",
+    "self_labels": ["12065550100", "Alex Doe (WA)"],
+    "recipient_guard_dir": "/path/to/folder/with/outbound_guards",
+    "voice_env_file": "/path/to/voice.env",
+    "voice_id_var": "WHATSAPP_VOICE_ID",
+    "voice_id": "",
+    "voice_background": ""
+  }
+}

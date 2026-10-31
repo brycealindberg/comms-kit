@@ -1,0 +1,3076 @@
+#!/usr/bin/env python3
+"""comms — query the .communications log without burning context.
+
+Every subcommand prints a compact, trimmed view by default. Use --full only
+when you actually need message bodies.
+"""
+import argparse
+import concurrent.futures
+import datetime
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+
+def _core_dir():
+    """Where commslib.py lives: COMMS_KIT_CORE, the folder above this script, then the
+    install the live Mac uses."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # kit: code path
+    # realpath: install.sh links this script into ~/.local/bin.
+    real = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # kit: code path
+    for folder in (os.environ.get("COMMS_KIT_CORE"), here, real,
+                   os.path.expanduser("~/.claude/communications")):
+        if folder and os.path.exists(os.path.join(folder, "commslib.py")):
+            return os.path.abspath(os.path.expanduser(folder))
+    return here
+
+
+CORE = _core_dir()
+sys.path.insert(0, CORE)
+# This tool's own reads are scans, not conversations: the comms CLIs skip their read log when
+# this is set (P0, 2026-10-30). Sends still log.
+os.environ.setdefault("COMMS_INTERNAL", "1")
+try:
+    import commslib as C  # noqa: E402
+except BaseException as _import_error:
+    if type(_import_error).__name__ == "ConfigError":
+        # a broken config file: one clear line, and nothing is written anywhere
+        sys.stderr.write("%s\n" % _import_error)
+        sys.exit(2)
+    # `comms doctor` exists to catch exactly this. `comms-log.py` imports the
+    # same library, so a commslib that will not import means the hook dies on
+    # every tool call and NOTHING is archived. Dying with a traceback out of
+    # this line hid it: the one failure the doctor was written for was the one
+    # it could never reach.
+    sys.stderr.write(
+        "comms: cannot import commslib.py (%s)\n"
+        "       %s is broken, so the PostToolUse hook imports it and dies\n"
+        "       too: NOTHING is being archived, on any channel.\n"
+        "       Reinstall commslib.py and comms-log.py together, LIBRARY "
+        "FIRST.\n"
+        % (_import_error, os.path.join(CORE, "commslib.py")))
+    sys.exit(2)
+
+import kitconfig  # noqa: E402  (commslib already imported it from the same folder)
+
+try:
+    import gmail_accounts as GA  # noqa: E402
+except BaseException:  # noqa: BLE001 - without it `comms` still reads the main account
+    GA = None
+
+SNIP = 160
+
+
+def tail(seq, n):
+    """Last n items.
+
+    Two traps here, and fixing the first created the second. `seq[-n:]` is
+    wrong because -0 == 0, so `--last 0` returned the whole archive. But
+    `seq[len(seq) - n:]` goes NEGATIVE when n > len(seq), so 29 matches with
+    the default --last 30 silently showed 1 row and printed an honest-looking
+    count. Clamp the start index.
+    """
+    return seq[max(0, len(seq) - n):] if n > 0 else []
+
+
+def rows(days=None):
+    # `if days else` treats --days 0 as 'no filter'; 0 means 'today'
+    cutoff = time.time() - days * 86400 if days is not None else 0
+    for path in sorted(glob.glob(os.path.join(C.STORE, "*.jsonl"))):
+        try:
+            with open(path) as fh:
+                for line in fh:
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    # a `ts` that is not a number -- hand-edited, or written
+                    # by an older hook -- used to raise TypeError here, and the
+                    # except below then abandoned the WHOLE month file, making
+                    # every message in it invisible to find/thread/backfill.
+                    try:
+                        ts = float(r.get("ts") or 0)
+                    except Exception:
+                        ts = 0.0
+                    if ts >= cutoff:
+                        yield r
+        except Exception:
+            continue
+
+
+def history_rows(days=None):
+    """The KB export in `<project>/history/`, if it has been run.
+
+    A separate reader on purpose. `rows()` walks the central store, which is
+    the live capture and the thing every write path treats as the source of
+    truth. The history export is a DIFFERENT archive with a different owner
+    (`comms_project_history_export.py`), so it is read here and written
+    nowhere -- no repair, reindex, prune or backfill may touch it.
+
+    Silent when the export has never been run: this yields nothing and every
+    command behaves exactly as it did before.
+    """
+    cutoff = time.time() - days * 86400 if days is not None else 0
+    routes = C._load(C.ROUTES, {}) or {}
+    folders = []
+    for route in routes.values():
+        path = (route or {}).get("path")
+        if not path:
+            continue
+        folder = os.path.join(path, "history")
+        if folder not in folders and os.path.isdir(folder):
+            folders.append(folder)
+    for folder in folders:
+        for path in sorted(glob.glob(os.path.join(folder, "*.jsonl"))):
+            try:
+                with open(path, errors="replace") as fh:
+                    for line in fh:
+                        try:
+                            r = json.loads(line)
+                        except Exception:
+                            continue
+                        if not isinstance(r, dict):
+                            continue
+                        try:
+                            ts = float(r.get("ts") or 0)
+                        except Exception:
+                            ts = 0.0
+                        if ts >= cutoff:
+                            yield r
+            except Exception:
+                continue
+
+
+def all_rows(a):
+    """Live capture plus exported history, oldest first.
+
+    `--live` restricts to the capture. History is included by DEFAULT because
+    the whole point of exporting it was that a question like "what did Sam
+    say in March" should be answerable without knowing which of two archives
+    holds March.
+    """
+    out = list(rows(getattr(a, "days", None)))
+    if not getattr(a, "live", False):
+        out.extend(history_rows(getattr(a, "days", None)))
+        out.sort(key=lambda r: float(r.get("ts") or 0))
+    return out
+
+
+# --------------------------------------------------------------- upwork render
+
+_UW_OPEN = "<untrusted_participant_content>"
+_UW_CLOSE = "</untrusted_participant_content>"
+# The stored body is the RAW MCP response and stays that way -- it is the
+# archive's contract that a row holds what the tool actually returned. The other
+# four channels return formatted text on stdout, so their rows already read like
+# a conversation; Upwork's transport is JSON, so a live row printed 200 chars of
+# `{"data":{"roomStories":{"edges":[{"cursor":"story_...` where the WhatsApp row
+# under it printed a sentence. Render at DISPLAY time instead: existing rows fix
+# themselves, and the capture hook -- which stops ALL archiving if it throws --
+# is not touched at all.
+_UW_PAIR_RE = re.compile(
+    r'"createdDateTime"\s*:\s*"([^"]+)".*?'
+    r'"from"\s*:\s*"(.*?)"(?<!\\").*?'
+    r'"message"\s*:\s*"(.*?)"(?<!\\")',
+    re.S)
+
+
+def _uw_unfence(value):
+    """Drop Upwork's prompt-injection fence. Anchored, so text that merely
+    imitates the fence is left alone."""
+    t = str(value or "")
+    if t.startswith(_UW_OPEN) and t.endswith(_UW_CLOSE):
+        return t[len(_UW_OPEN):-len(_UW_CLOSE)].strip("\n")
+    return t
+
+
+def _uw_when(raw):
+    """`2026-05-03T07:40:22.606Z` -> `2026-05-03 03:40` in the Mac's local zone (it follows
+    the owner as he travels), the one every other timestamp here is shown in."""
+    t = str(raw or "").strip()
+    if not t:
+        return ""
+    if t.endswith(("Z", "z")):
+        t = t[:-1] + "+00:00"
+    try:
+        d = datetime.datetime.fromisoformat(t)
+    except Exception:
+        return str(raw)[:16]
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=datetime.timezone.utc)
+    return d.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def upwork_render(body):
+    """Readable conversation lines from an Upwork `list_messages` payload.
+
+    Returns "" for anything that is not one, so the caller can fall back. TWO
+    paths on purpose: `BODY_CAP` truncates a long room mid-JSON, and the only
+    such row in the live archive IS truncated -- a json-only reader would have
+    rendered nothing for the exact row that needed it.
+    """
+    if not body or "roomStories" not in body:
+        return ""
+    rows = []
+    try:
+        nodes = ((json.loads(body).get("data") or {})
+                 .get("roomStories") or {}).get("edges") or []
+        for edge in nodes:
+            n = (edge or {}).get("node") or {}
+            rows.append((n.get("createdDateTime"), n.get("from"),
+                         n.get("message")))
+    except Exception:
+        rows = []
+    if not rows:
+        # truncated or otherwise unparsable: sweep the raw text in order
+        for when, who, msg in _UW_PAIR_RE.findall(body):
+            def _un(x):
+                try:
+                    return json.loads('"%s"' % x)
+                except Exception:
+                    return x
+                # a lone escape at the cut point is the only failure here
+            rows.append((when, _un(who), _un(msg)))
+    if not rows:
+        return ""
+    lines = []
+    for when, who, msg in reversed(rows):      # API gives newest first
+        who = _uw_unfence(who).strip() or "?"
+        msg = " ".join(_uw_unfence(msg).split())
+        if not msg:
+            continue
+        lines.append("[%s] %s: %s" % (_uw_when(when), who, msg))
+    return "\n".join(lines)
+
+
+def readable(r):
+    """What a human should see for this row: the extracted text when the capture
+    found one, else a rendered body, else the raw body."""
+    if r.get("text"):
+        return r["text"]
+    body = r.get("body") or ""
+    if r.get("channel") == "upwork":
+        try:
+            got = upwork_render(body)
+        except Exception:
+            got = ""
+        if got:
+            return got
+    return body
+
+
+def snippet(r, query=None):
+    body = " ".join(readable(r).split())
+    if query:
+        i = body.lower().find(query.lower())
+        if i > 0:
+            body = "…" + body[max(0, i - 40):]
+    out = body[:SNIP]
+    # an attachment-only send has no text at all and used to render as a blank
+    # row, which reads as "nothing was sent"
+    files = r.get("files")
+    if files:
+        tag = "[attached: %s]" % ", ".join(str(f) for f in files[:3])
+        out = (out + " " + tag).strip() if out else tag
+    return out
+
+
+def show(rs, query=None, full=False):
+    if not rs:
+        print("no matches")
+        return
+    for r in rs:
+        head = "%s  %-8s %-6s %-18s %s%s" % (
+            r.get("et", "")[:16], r.get("channel", ""), r.get("dir", ""),
+            (r.get("label") or r.get("target") or "")[:18],
+            r.get("project") or "-",
+            "  [kb]" if r.get("source") == "kb" else "")
+        print(head + ("  [account: %s]" % r["account"] if r.get("account") else ""))
+        if full:
+            # match BODY_CAP: truncating at 4k made up to 16k of a captured
+            # row unreachable, while the skill forbids cat-ing the raw file
+            print("    " + readable(r)
+                  .replace("\n", "\n    ")[:C.BODY_CAP])
+        else:
+            print("    " + snippet(r, query))
+    print("\n%d row(s)" % len(rs))
+
+
+def cmd_find(a):
+    q = a.query.lower()
+    out = []
+    for r in all_rows(a):
+        if a.channel and r.get("channel") != a.channel:
+            continue
+        if a.project is not None and r.get("project") != a.project:
+            continue
+        hay = " ".join(str(r.get(k) or "") for k in
+                       ("text", "body", "target", "label", "project")) + \
+            " " + " ".join(r.get("recipients") or [])
+        if q in hay.lower():
+            out.append(r)
+    show(tail(out, a.last), q, a.full)
+
+
+def cmd_thread(a):
+    key = C.norm(a.target)
+    out = [r for r in all_rows(a)
+           if r.get("target") == key
+           or key in (r.get("recipients") or [])
+           or (r.get("label") or "").lower() == a.target.lower()]
+    show(tail(out, a.last), None, a.full)
+
+
+def cmd_recent(a):
+    show(tail(all_rows(a), a.last), None, a.full)
+
+
+def cmd_routes(a):
+    rt = C._load(C.ROUTES, {})
+    if not rt:
+        print("no routes yet — run: comms route <target> <project> "
+              "--path /abs/repo")
+        return
+    for k, v in sorted(rt.items(), key=lambda x: x[1].get("project", "")):
+        print("%-16s -> %-22s %s" % (k, v.get("project", ""),
+                                     v.get("path") or ""))
+
+
+def cmd_route(a):
+    _rewrite_note()
+    with _rewrite_lock():
+        return _route(a)
+
+
+def cmd_unroute(a):
+    """Drop one route key (and the aliases stored with it). The team inbox's People and channels
+    removes a person or chat from a client; the relay's apply_overlay.py runs this with --from, so
+    a key the owner routed somewhere else since is never removed. Thread stamps are left alone: the
+    history stays the client's, and new rows carry no project."""
+    _rewrite_note()
+    with _rewrite_lock():
+        return _unroute(a)
+
+
+def _unroute(a):
+    rt = C.load_strict(C.ROUTES, {})
+    if rt is None:
+        print("routes.json is unreadable; nothing changed")
+        return 1
+    key = C.norm(a.target)
+    v = rt.get(key)
+    if not isinstance(v, dict):
+        print("not routed: %s" % key)
+        return 0
+    if a.from_project and v.get("project") != a.from_project:
+        print("%s is routed to %s, not %s; nothing changed" % (key, v.get("project"), a.from_project))
+        return 1
+    del rt[key]
+    C._save(C.ROUTES, rt)
+    print("unrouted: %s (was %s)" % (key, v.get("project")))
+    return 0
+
+
+def _route(a):
+    # load_strict, not _load: this is a read-modify-write, and a torn read that
+    # silently returns {} would rewrite routes.json with ONE route in it.
+    rt = C.load_strict(C.ROUTES, {}) or {}
+    key = C.norm(a.target)
+    path = os.path.abspath(os.path.expanduser(a.path)) if a.path else None
+    if path and not os.path.isdir(path):
+        print("path does not exist: %s" % path)
+        return 1
+    aliases = [C.norm(x) for x in (a.alias or []) if C.norm(x)]
+    # UNION with what is already on record, never a replace. `--alias` reads as
+    # "another identifier for the SAME person", and a re-route that names one of
+    # them used to drop every other alias on the floor -- measured 2026-09-10:
+    # `comms route sam@example.org acme_corp --alias 18f0aa00bb11cc22` deleted
+    # three Gmail thread ids and stranded 6 mirrored rows with no route to
+    # rebuild them from. Same failure `--path` already had, same fix. There is
+    # no CLI way to REMOVE an alias, so a union gives up nothing.
+    for prev in (rt.get(key) or {}).get("aliases") or []:
+        prev = C.norm(prev)
+        if prev and prev not in aliases:
+            aliases.append(prev)
+    # Omitting --path on a re-route used to null the stored path, orphaning
+    # the repo mirror -- and `_sync_mirrors` printed exactly that command as
+    # its advice, so following the tool's own note destroyed the route.
+    if path is None:
+        path = (rt.get(key) or {}).get("path")
+    if path is None:
+        # A NEW spelling of a person whose project already has a home. Without
+        # this the row gets a project STAMP and no mirror destination, which
+        # `stats` and `unrouted` both report as fully routed -- the same
+        # stamp-outlives-the-map failure as the alias bug above, reached by a
+        # different door. Measured 2026-09-12: `comms route "alex doe"
+        # alex_doe` stamped 16 rows and mirrored none of them, and the
+        # rebuild-from-routes.json recipe could not recover them because the
+        # map it rebuilds from held `"path": null`.
+        for other in rt.values():
+            if other.get("project") == a.project and other.get("path"):
+                path = other["path"]
+                print("path not given; inheriting %s from another %s route"
+                      % (path, a.project))
+                break
+    rt[key] = {"project": a.project, "path": path,
+               "label": a.label or a.project, "aliases": aliases}
+    C._save(C.ROUTES, rt)
+    # stamp existing threads + rows so history joins the project.
+    # Under the SAME lock the hook uses: read-modify-write with no lock let a
+    # capture landing mid-command lose its index entry.
+    with C.filelock(C.THREADS):
+        th = C.load_strict(C.THREADS, {}) or {}
+        touched = False
+        # every identifier for this person, not just the one on the command
+        # line: `comms stats` reads the project straight off the thread, so an
+        # unstamped alias made stats and `comms unrouted` disagree
+        for k in [key] + aliases:
+            if k in th:
+                th[k]["project"] = a.project
+                th[k]["label"] = a.label or a.project
+                touched = True
+        if touched:
+            C._save(C.THREADS, th)
+            C.write_index(C.ROOT, th)
+    # restamp/backfill EVERY identifier for this person, not just the one
+    # named on the command line — a contact reached on two channels has two
+    # keys, and aliases previously only affected FUTURE captures
+    stamped = 0
+    for k in [key] + aliases:
+        stamped += restamp(k, a.project, a.label or a.project)
+    print("routed %s -> %s%s" % (key, a.project,
+                                 (" (%s)" % path) if path else ""))
+    if stamped:
+        print("stamped %d past central row(s)" % stamped)
+    if path:
+        n = sum(backfill(k, a.project, a.label or a.project, path)
+                for k in [key] + aliases)
+        print("backfilled %d past message(s) into %s/%s"
+              % (n, path, C.DIR_NAME))
+    else:
+        # never let a half-route pass as a route: with no path this key stamps
+        # a project onto rows and mirrors none of them, now or in future
+        print("WARNING no path for project %s%s. Nothing will mirror to a repo "
+              "until you re-run with --path /abs/repo."
+              % (a.project,
+                 (", so %d stamped row(s) were NOT mirrored" % stamped)
+                 if stamped else ""))
+
+
+def restamp(key, project, label):
+    """Stamp past central rows for this contact, so `find --project` and the
+    index agree with history instead of only with messages sent after the
+    route was created."""
+    n = 0
+    for f in sorted(glob.glob(os.path.join(C.STORE, "*.jsonl"))):
+        try:
+            entries, size = _read_rows(f)
+        except Exception:
+            continue
+        changed = False
+        for e in entries:
+            r = e[0]
+            if r is None:
+                continue
+            if r.get("target") == key and r.get("project") != project:
+                r["project"], r["label"] = project, label
+                changed = True
+                n += 1
+        if changed:
+            # through _rewrite like every other store rewriter. The old
+            # in-place `f + ".tmp"` had a SHARED name, took no lock and kept no
+            # size snapshot, so a row the hook appended mid-run was lost.
+            _rewrite(f, entries, size)
+    return n
+
+
+def _mirror_key(r):
+    """The identity of one mirrored row.
+
+    `ts` ALONE is not it, in either direction, and this was measured on live
+    data 2026-09-10. One Bash line produces several rows that share a
+    millisecond, so a project holding two of them mirrored the first and
+    silently DROPPED the second as a duplicate -- `acme` finished one row
+    short. And two sends to one person inside the same millisecond round to the
+    same `ts`, so both were written and the mirror gained a duplicate line
+    (`proj_one`, `proj_two`). Same tuple `_sync_mirrors` matches
+    on; the two must agree or a repair and a backfill disagree about what a row
+    is.
+    """
+    return (r.get("ts"), r.get("channel"), r.get("target"), r.get("command"))
+
+
+def backfill(key, project, label, path):
+    folder = os.path.join(path, C.DIR_NAME)
+    seen = set()
+    for f in glob.glob(os.path.join(folder, "*.jsonl")):
+        try:
+            for line in open(f):
+                got = json.loads(line)
+                if isinstance(got, dict):
+                    seen.add(_mirror_key(got))
+        except Exception:
+            pass
+    n = 0
+    for r in rows(None):
+        if r.get("target") != key:
+            continue
+        mk = _mirror_key(r)
+        if mk in seen:
+            continue
+        # add as we go: two rows of ONE backfill run can share the tuple too,
+        # and a `seen` built only from disk cannot see them
+        seen.add(mk)
+        r["project"], r["label"] = project, label
+        month = (r.get("et") or "")[:7] or "backfill"
+        C.append_jsonl(os.path.join(folder, month + ".jsonl"), r)
+        n += 1
+    # build the index from what was ACTUALLY backfilled — threads.json only
+    # knows contacts the live hook has seen, so routing a historical contact
+    # produced a header-only index sitting next to real rows
+    th = C._load(C.THREADS, {})
+    if key not in th:
+        seen = [r for r in rows(None) if r.get("target") == key]
+        if seen:
+            th = dict(th)
+            th[key] = {"target": key, "channel": seen[-1].get("channel"),
+                       "count": len(seen), "last_ts": seen[-1].get("ts"),
+                       "last_et": seen[-1].get("et"), "first_et":
+                       seen[0].get("et"), "project": project, "label": label}
+    C.write_index(folder, th, project=project)
+    root = C.git_root(path)
+    if root:
+        C.ensure_gitignore(root)
+    return n
+
+
+def cmd_unrouted(a):
+    """Contacts with no project yet.
+
+    UNROUTED.md is append-only, so it listed contacts that had since been
+    routed. Filter it against the live route map at read time rather than
+    trusting the file.
+    """
+    routes = C._load(C.ROUTES, {})
+    threads = C._load(C.THREADS, {}) or {}
+    pending = []
+    for key, t in threads.items():
+        if C.route(key, routes) or t.get("project"):
+            continue
+        pending.append(t)
+    if not pending:
+        print("nothing unrouted")
+        return
+    pending.sort(key=lambda r: -(r.get("last_ts") or 0))
+    seen = _unrouted_seen_from()
+    print("%-34s %-9s %5s  %-16s  %s" % ("TARGET", "CHANNEL", "MSGS", "LAST",
+                                         "SEEN FROM"))
+    for t in pending:
+        print(("%-34s %-9s %5d  %-16s  %s" % (
+            str(t.get("target"))[:34], t.get("channel", ""),
+            t.get("count", 0), (t.get("last_et") or "")[:16],
+            seen.get(t.get("target"), ""))).rstrip())
+    print("\nroute one with:  comms route <target> <project> --path /abs/repo")
+
+
+_UNROUTED_ROW = re.compile(r"^\|\s*`([^`]+)`\s*\|([^|]*)\|([^|]*)\|")
+
+
+def _unrouted_seen_from():
+    """target -> the folder its first unrouted call ran from (UNROUTED.md).
+
+    The SessionStart comms note sends the reader here for this folder, the
+    best clue to which client repo a contact belongs to. Best-effort: a
+    missing or odd file just means no folder column.
+    """
+    out = {}
+    try:
+        with open(C.UNROUTED, errors="replace") as fh:
+            for line in fh:
+                m = _UNROUTED_ROW.match(line)
+                if m and m.group(3).strip():
+                    out[m.group(1)] = m.group(3).strip()
+    except OSError:
+        pass
+    return out
+
+
+def cmd_reindex(a):
+    _rewrite_note()
+    with _rewrite_lock():
+        _repair(a)
+        return _reindex(a)
+
+
+def _repairable_text(r):
+    """Text the CURRENT library can recover for a row that has none.
+
+    Entirely LOCAL -- the tool's own echo inside the stored body, or the
+    iMessage preview store -- so unlike `comms backfill` it costs no network
+    call. A row keeps its raw body, so a later fix to the parser retroactively
+    un-loses words: the WhatsApp echo scan was rewritten on 2026-09-09 and
+    rows captured before it still hold readable bubbles.
+    """
+    body = r.get("body")
+    if r.get("text") or not isinstance(body, str) or not body:
+        return None
+    if r.get("dir") not in ("send", "draft"):
+        return None
+    # A `truncated` body was cut at 20 KB, so an echo in it can end
+    # mid-sentence, and recovering from that archives a SHORTER message than
+    # the one actually sent with nothing to mark it partial. A row from before
+    # the flag existed has no key at all, so fall back to the length -- exactly
+    # as the re-key gate does with `fc_cut`. Reading a missing key as False
+    # repaired the very rows this pass targets.
+    cut = r.get("truncated")
+    if (len(body) >= C.BODY_CAP) if cut is None else bool(cut):
+        return None
+    try:
+        got = C.recover_sent(body, r.get("channel"), r.get("verb"),
+                             r.get("dir"),
+                             r.get("raw_target") or r.get("target"))
+    except Exception:
+        return None
+    text = (got or {}).get("text")
+    if not text:
+        return None
+    return C.redact(text[:C.BODY_CAP]), got.get("source")
+
+
+def _party_from_own_body(r):
+    """The correspondent named by THIS row's own captured output, or None."""
+    # The blob is shared by every row of its Bash line, so a second `gws gmail`
+    # call in the same line makes its headers unattributable. That needs the
+    # WHOLE command, and a command that was cut or redacted cannot answer it.
+    fc = r.get("full_command")
+    if not isinstance(fc, str) or not fc:
+        return None
+    flag = r.get("fc_cut")
+    if C.was_redacted(fc) or (len(fc) >= 2000 if flag is None else bool(flag)):
+        return None
+    if sum(1 for ch, _s in C.detect_all(fc) if ch == "gmail") != 1:
+        return None
+    body = r.get("body")
+    return C.gmail_party(body) if isinstance(body, str) else None
+
+
+_WA_GROUP_RE = (
+    re.compile(r"History for GROUP\s+(.+?)\s*\(\d+\s+message", re.I),
+    re.compile(r"\[group\]\s+(.+?)\s*\(last:", re.I),
+)
+
+
+def _wa_group_names(body):
+    """Every group name this body names, in order. Usually one; sometimes many."""
+    out = []
+    for rx in _WA_GROUP_RE:
+        for m in rx.finditer(body or ""):
+            name = m.group(1).strip()
+            if name:
+                out.append(name)
+    return out
+
+
+def _wa_room_groups(files):
+    """whatsapp room id -> the group name its own rows AGREE on.
+
+    `whatsapp` names a group by its title on one call and by its `!room` id on
+    the next, so one conversation lands under two keys and only the spelling
+    that was routed gets filed. Measured 2026-09-16: one client group
+    had 107 rows sitting unrouted under its room id, four days after the same
+    group was routed by name.
+
+    Two rules keep this safe on output nobody controls. A body that names MORE
+    than one group abstains entirely -- a single read can print several chats,
+    and the first title in the blob is not necessarily this row's (the same
+    shared-payload trap `_gmail_id_owners` documents). And a name wins only on
+    a strict majority backed by at least 2 rows. On the live archive that is
+    what separates one group's 57 votes from the 1 stray row that named a
+    different group it merely shared a payload with.
+    """
+    votes = {}
+    for path in files:
+        for e in files[path][0]:
+            r = e[0]
+            if not isinstance(r, dict) or r.get("channel") != "whatsapp":
+                continue
+            rid = C.norm(str(r.get("target") or ""))
+            if not rid.startswith("!"):
+                continue
+            names = set(_wa_group_names(r.get("body") or ""))
+            if len(names) != 1:
+                continue
+            votes.setdefault(rid, {})
+            name = names.pop()
+            votes[rid][name] = votes[rid].get(name, 0) + 1
+    out = {}
+    for rid, tally in votes.items():
+        best = max(tally, key=lambda k: tally[k])
+        if tally[best] >= 2 and tally[best] * 2 > sum(tally.values()):
+            out[rid] = best
+    return out
+
+
+def _gmail_id_owners(files):
+    """gmail message id -> the one correspondent a SIBLING row resolved.
+
+    `gws gmail +reply --message-id <id>` prints an API receipt and no headers,
+    so its own body can never name anybody. The `messages.get` beside it in the
+    same session prints the headers and carries the SAME id. Measured on the
+    live archive 2026-09-10: one id, four rows, one of them resolvable -- and
+    repairing only that one SPLIT the thread three ways instead of joining it.
+
+    An id is used only when every row that resolved it agrees. Two different
+    answers means the id was reused or the output was misread, and a wrong
+    merge is worse than an unresolved key.
+    """
+    owners, dead = {}, set()
+    for _path, (entries, _size, _dirty) in files.items():
+        for e in entries:
+            r = e[0]
+            if not isinstance(r, dict) or r.get("channel") != "gmail":
+                continue
+            cur = str(r.get("raw_target") or r.get("target") or "").strip()
+            key = cur.lower()
+            if not C.GMAIL_ID_RE.match(key) or key in dead:
+                continue
+            try:
+                who = _party_from_own_body(r)
+            except Exception:
+                continue
+            if not who:
+                continue
+            prev = owners.get(key)
+            if prev is not None and C.norm(prev) != C.norm(who):
+                dead.add(key)
+                owners.pop(key, None)
+                continue
+            owners[key] = who
+    return owners
+
+
+def _repairable_target(r, id2who=None, id2group=None):
+    """A real correspondent for a gmail row filed under a non-person key.
+
+    Two shapes, one cause -- the command named no person: a 16-hex message id,
+    and the owner's OWN address, which is a thread with himself that never
+    happened (7 archived rows). Both are resolved from the message's own
+    headers, and a message id falls back to whatever a sibling row holding the
+    SAME id resolved.
+    """
+    if r.get("channel") == "whatsapp":
+        cur = C.norm(str(r.get("raw_target") or r.get("target") or ""))
+        if not cur.startswith("!"):
+            return None
+        name = (id2group or {}).get(cur)
+        # only a name the WHOLE archive agrees on, and never a no-op
+        return name if name and C.norm(name) != cur else None
+    if r.get("channel") != "gmail":
+        return None
+    cur = str(r.get("raw_target") or r.get("target") or "")
+    is_id = bool(C.GMAIL_ID_RE.match(cur.strip().lower()))
+    if not (is_id or C.email_key(cur) in C.self_emails()):
+        return None
+    who = _party_from_own_body(r)
+    if not who and is_id and id2who:
+        # no headers of its own. The sibling's answer is keyed on the id this
+        # row's own command named, so the shared-payload trap does not apply:
+        # nothing here is read out of THIS row's blob.
+        who = id2who.get(cur.strip().lower())
+    if not who or C.norm(who) == C.norm(cur):
+        return None
+    return who
+
+
+def _repair(a):
+    """Re-run TODAY's parsers over rows an older one could not read.
+
+    Nothing here asks the network; both repairs read the row's own stored
+    body. Counted by default and written only with `--repair`, because it
+    rewrites the durable record -- the same opt-in shape as `--prune`.
+    """
+    texts = keys = 0
+    patched, rekeys, files = [], [], {}
+    for path in sorted(glob.glob(os.path.join(C.STORE, "*.jsonl"))):
+        entries, size = _read_rows(path)
+        files[path] = [entries, size, False]
+    # built over EVERY file before anything is repaired: the row that resolves
+    # an id and the rows that need it can sit in different months
+    id2who = _gmail_id_owners(files)
+    # A re-key must never trade a FILED row for an unfiled one. Three of the
+    # ten groups the archive agrees on are routed under their room id and not
+    # under their title, so re-keying them by title would have moved 55 rows
+    # out of their project -- the repair would have read as a success and
+    # silently unfiled a client. Keep a mapping only when the title routes
+    # somewhere, or when the id routes nowhere so there is nothing to lose;
+    # and never when the two route to DIFFERENT projects, which is a question
+    # for a human, not a parser.
+    _now = C._load(C.ROUTES, {}) or {}
+    id2group = {}
+    for _rid, _nm in _wa_room_groups(files).items():
+        by_name = (C.route(_nm, _now) or {}).get("project")
+        by_id = (C.route(_rid, _now) or {}).get("project")
+        if by_name and by_id and by_name != by_id:
+            continue
+        if by_name or not by_id:
+            id2group[_rid] = _nm
+    for path in sorted(files):
+        entries = files[path][0]
+        for e in entries:
+            r = e[0]
+            if not isinstance(r, dict):
+                # a torn line, or a row some other writer left malformed. The
+                # count pass must never be the thing that stops a rebuild.
+                continue
+            try:
+                got = _repairable_text(r)
+                who = _repairable_target(r, id2who, id2group)
+            except Exception:
+                continue
+            if got:
+                texts += 1
+                if a.repair:
+                    r["text"], r["text_source"] = got
+                    r["text_repaired"] = True
+                    files[path][2] = True
+                    patched.append(r)
+            if who:
+                keys += 1
+                if a.repair:
+                    # the OLD project, captured before the re-key overwrites
+                    # it -- the note used to be computed from the new routing,
+                    # so it stayed silent in exactly the case it was for
+                    rekeys.append((r, r.get("target"), r.get("project"), who))
+                    files[path][2] = True
+    if not texts and not keys:
+        return 0
+    if not a.repair:
+        print("repairable from the stored output, with no network call:\n"
+              "  %d send(s) whose text an older parser could not read\n"
+              "  %d row(s) keyed by an id instead of a person or group\n"
+              "  run `comms reindex --repair` to fill them\n"
+              % (texts, keys))
+        return 0
+    # mirrors FIRST: a mirror row is matched on the target it still holds
+    synced = _sync_mirrors(patched) if patched else 0
+    routes = C._load(C.ROUTES, {}) or {}
+    for r, _old, _oldproj, who in rekeys:
+        r["raw_target"], r["target"] = who, C.norm(who)
+        # the new key can route somewhere the old one did not
+        hit = C.route(who, routes) or {}
+        r["project"], r["label"] = hit.get("project"), hit.get("label")
+    for path, (entries, size, dirty) in files.items():
+        if dirty:
+            _rewrite(path, entries, size)
+    print("repaired: %d text%s, %d row(s) re-keyed"
+          % (texts, "" if not synced else " (%d mirror row(s) too)" % synced,
+             keys))
+    stale = sorted(set((old, oldproj, r.get("target"))
+                       for r, old, oldproj, _w in rekeys if oldproj))
+    for old, oldproj, new in stale:
+        print("  note: %s was re-keyed to %s. It was filed under %s, and the "
+              "new key is%s routed, so %s's repo mirror keeps an orphan under "
+              "the old key -- run `comms route %s %s --path <repo>` and "
+              "re-run this to rebuild it"
+              % (old, new, oldproj,
+                 "" if C.route(new, routes) else " NOT", oldproj, new,
+                 oldproj))
+    return 0
+
+
+def _reindex(a):
+    """Rebuild threads.json and INDEX.md from the .jsonl rows.
+
+    The .jsonl is the durable record — appends are atomic under O_APPEND and
+    survived 1,376 concurrent writes with zero loss. threads.json is derived,
+    so it is always safe to throw away and rebuild. Also drops rows that a
+    later parser fix would have rejected.
+    """
+    threads, kept, dropped, torn, would = {}, 0, 0, 0, 0
+    for f in sorted(glob.glob(os.path.join(C.STORE, "*.jsonl"))):
+        entries, size = _read_rows(f)
+        good = []
+        for r, raw in entries:
+            if not isinstance(r, dict):
+                # A torn line is a hook that was killed mid-append, so it may
+                # still hold a real message. It is kept verbatim rather than
+                # counted as a drop; this rewrite used to delete it.
+                # A line that parses to something that is not an object (a
+                # list, a bare string, a number) is treated the same way -- it
+                # used to raise `AttributeError: 'list' object has no attribute
+                # 'get'` and abort the whole rebuild, and `reindex` is the tool
+                # you reach for precisely when the store is damaged.
+                good.append([None, raw])
+                torn += 1
+                continue
+            # NEVER re-judge a truncated body. The hook ran `failed()` on the
+            # FULL output and then stored only the first 20 KB, so the stored
+            # copy can be missing the `Sent. event_id=` that proved delivery --
+            # re-running the check here deleted a message that really went out.
+            # A row whose stored copy was CUT is not safe to re-judge by
+            # either rule: `body` is capped at 20 KB and `full_command` at
+            # 2000, so the evidence the hook used may simply not be here.
+            fc = r.get("full_command")
+            fc = fc if isinstance(fc, str) else ""
+            flag = r.get("fc_cut")
+            # TWO different cuts, two different gates. `truncated` is about the
+            # BODY, which is what `failed()` reads. `fc_cut` and redaction are
+            # about the COMMAND, which is what re-detection reads. One shared
+            # flag made a row from a long command immune to the `failed()`
+            # check for ever, and judged the same data two ways depending only
+            # on whether the hook that captured it predated the flag.
+            body_cut = bool(r.get("truncated"))
+            # Every redaction is SHORTER than what it replaced, so a scrubbed
+            # command can sit under the cap while the original ran past it --
+            # and it rewrites the very text re-detection parses. It disqualifies
+            # the command whatever the length flag says.
+            cmd_cut = C.was_redacted(fc) or (
+                len(fc) >= 2000 if flag is None else bool(flag))
+            try:
+                reject = (not body_cut and
+                          C.failed(r.get("body"),
+                                   empty_counts=(r.get("dir") == "read"),
+                                   channel=r.get("channel"),
+                                   target=(r.get("raw_target")
+                                           or r.get("target"))))
+            except Exception:
+                # a row with a wrong-typed field is not evidence that the
+                # message failed. Keep it.
+                reject = False
+            # re-apply CURRENT detection to rows that kept their original
+            # command, so a later parser fix retroactively cleans history
+            if (not reject and not cmd_cut and fc
+                    and r.get("channel") != "upwork"):
+                ok = False
+                try:
+                    for chan, seg in C.detect_all(fc):
+                        if C.VERBS[chan].get(C.parse(chan, seg)["verb"]):
+                            ok = True
+                            break
+                except Exception:
+                    ok = True          # cannot re-detect: do not reject
+                reject = not ok
+            if reject:
+                # Dropping is now OPT-IN. The verb map is the CURRENT one, so a
+                # CLI that renames a verb makes every archived row of that verb
+                # look unclassified -- and a silent rebuild then deleted three
+                # real sends that had recovered text on them.
+                if a.prune:
+                    dropped += 1
+                    continue
+                would += 1
+            good.append([r, raw])
+            kept += 1
+            k = r.get("target")
+            t = threads.setdefault(k, {"target": k, "channel": r.get("channel"),
+                                       "count": 0, "first_et": r.get("et")})
+            t["count"] += 1
+            t["last_ts"] = r.get("ts")
+            t["last_et"] = r.get("et")
+            t["channel"] = r.get("channel")
+            t["project"] = r.get("project")
+            t["label"] = r.get("label")
+        if len(good) == len(entries):
+            continue                      # nothing to drop: leave it alone
+        # ALWAYS through _rewrite, even when `good` is empty. `os.remove(f)`
+        # took the whole month with it, including rows another session had
+        # appended while the rebuild was running.
+        _rewrite(f, good, size)
+    with C.filelock(C.THREADS):
+        C._save(C.THREADS, threads)
+        C.write_index(C.ROOT, threads)
+    pruned = _prune_unrouted_note(threads)
+    print("rebuilt from rows: %d kept, %d dropped, %d thread(s)%s%s%s"
+          % (kept, dropped, len(threads),
+             "" if not torn else ", %d torn line(s) left in place" % torn,
+             "" if not pruned else
+             ", %d filed contact(s) dropped from UNROUTED.md" % pruned,
+             "" if not would else
+             "\n%d row(s) the CURRENT rules would reject are still there -- "
+             "look at them with `comms recent`, then `comms reindex --prune` "
+             "to delete them" % would))
+
+
+UNROUTED_ROW_RE = re.compile(r"^\|\s*`([^`]+)`\s*\|")
+
+
+def _prune_unrouted_note(threads):
+    """Drop contacts from UNROUTED.md once they have a project.
+
+    The hook only ever APPENDS there, so the file grew into a list that was
+    mostly wrong: on 2026-09-10 it held 59 rows, and the contacts at the top
+    (`104`, `sam@example.org`) had been routed hours earlier. It is a file a
+    human opens, so a stale row is not merely untidy, it is a false statement.
+    `threads.json` was just rebuilt from the rows, so it is the authority here.
+
+    A target the archive no longer knows at all is dropped too -- it cannot be
+    routed and nothing can look it up.
+    """
+    keep_row = set(k for k, t in threads.items()
+                   if isinstance(t, dict) and not t.get("project"))
+    try:
+        with C.filelock(C.UNROUTED):
+            if not os.path.exists(C.UNROUTED):
+                return 0
+            with open(C.UNROUTED, errors="replace") as fh:
+                lines = fh.readlines()
+            out, dropped = [], 0
+            for line in lines:
+                m = UNROUTED_ROW_RE.match(line)
+                if m and C.norm(m.group(1)) not in keep_row:
+                    dropped += 1
+                    continue
+                out.append(line)
+            if dropped:
+                with open(C.UNROUTED, "w") as fh:
+                    fh.write("".join(out))
+                os.chmod(C.UNROUTED, 0o600)
+            return dropped
+    except Exception:
+        return 0        # never let housekeeping fail a rebuild
+
+
+def _b64url(data):
+    import base64
+    pad = "=" * (-len(data) % 4)
+    text = base64.urlsafe_b64decode(data + pad).decode("utf-8", "replace")
+    # SMTP line endings are CRLF. Stored raw they put a literal \r in every
+    # line of an archived email, which every other channel's rows do not have
+    # and which shows up in `comms find` output.
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _gmail_part(payload, want):
+    """Depth-first search of a Gmail payload for one mime type.
+
+    A part with a `filename` is an ATTACHMENT, never the message. Without that
+    check a `multipart/mixed` whose first part is an attached
+    `quarterly_numbers.txt` archives the spreadsheet as the words the owner sent.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if (payload.get("filename") or "").strip():
+        return None
+    mime = (payload.get("mimeType") or "").lower()
+    data = ((payload.get("body") or {}).get("data")) or ""
+    if data and (mime.startswith(want) or (not mime and want == "text/plain")):
+        try:
+            return _b64url(data)
+        except Exception:
+            return None
+    for part in (payload.get("parts") or []):
+        got = _gmail_part(part, want)
+        if got:
+            return got
+    return None
+
+
+def _gmail_body(payload):
+    """The words of a Gmail `format:"full"` message.
+
+    Plain text is searched over the WHOLE tree before html is considered.
+    Doing the html fallback inside the recursion instead returned the html
+    sibling of a multipart/alternative — measured: a real body came back as
+    the single letter "x" because the html part was visited first.
+    """
+    got = _gmail_part(payload, "text/plain")
+    if got:
+        return _unquote(got)
+    got = _gmail_part(payload, "text/html")
+    return _unquote(_strip_html(got)) if got else None
+
+
+# ONLY the two markers a mail client actually generates, and both are strict:
+#   - Gmail's attribution line, which always carries a 4-digit year and ends in
+#     `wrote:`. A loose `^On .*wrote:` deleted a real message that began
+#     "Quick recap. On Tuesday I wrote:".
+#   - Outlook's `-----Original Message-----` rule.
+# `From:` and a row of underscores were tried and REMOVED: a forwarded SOW and a
+# message quoting an accounts address both lost their whole body to them.
+QUOTE_RE = re.compile(
+    r"^(?:On\b.{0,160}\b\d{4}\b.{0,160}?\bwrote:\s*$"
+    r"|-{3,}\s*Original Message\s*-{3,}\s*$)", re.M)
+
+
+def _unquote(text):
+    """Cut the quoted reply chain off the bottom, or leave the text alone.
+
+    A reply's text/plain part carries the WHOLE thread, so archiving it whole
+    files the client's words inside a row marked `dir: "send"`. But cutting is
+    destructive, so it only happens when all three hold:
+      1. the marker is not the first line -- otherwise the "reply" IS the whole
+         body and cutting leaves a bare horizontal rule
+      2. something substantial survives above it
+      3. what is below really looks quoted
+    Anything else is returned untouched. Keeping a quote costs a few hundred
+    characters; cutting a real message loses it.
+    """
+    if not text:
+        return text
+    m = QUOTE_RE.search(text)
+    if not m:
+        # No attribution line means no evidence a mail client quoted anything.
+        # Stripping a trailing `>` block on its own ate the message: "here is
+        # what the client said, word for word:" followed by their words, and a
+        # "paste me what you get back:\n> npm run deploy" both lost the point.
+        return text
+    head, rest = text[:m.start()], text[m.end():]
+    if not head.strip():
+        return text                       # marker is the first line
+    if len(head.strip()) < 20:
+        return text                       # nothing substantial above it
+    # What is below the marker has to be MOSTLY quoted for this to be a
+    # trailing thread. A bottom-post -- the client answering UNDER the quote,
+    # which Outlook and every mobile client do by default -- puts the real
+    # reply down there, and cutting at the marker threw away 700 of 729
+    # characters of a live client email. Two quoted lines above a four-
+    # paragraph answer is not a thread.
+    lines = [ln for ln in rest.splitlines() if ln.strip()]
+    quoted = sum(1 for ln in lines if ln.lstrip().startswith(">"))
+    if not lines:
+        return text
+    # Four fifths, not a bare majority. A bottom-post whose quote happens to be
+    # as long as the reply sat right on a simple majority and was cut in half;
+    # a real trailing thread is nearly all `>` lines plus at most a signature.
+    if quoted * 5 < len(lines) * 4:
+        return text
+    # The trailing `>` block above the marker is NOT stripped. It was, and it
+    # ate the substance of "here is exactly what they wrote to me:" followed by
+    # the client\'s own quoted words -- leaving only the intro line. A stray
+    # quote line costs a few characters; that cut lost the message.
+    return head.rstrip() if head.strip() else text
+
+
+def _strip_html(html):
+    """Enough HTML-to-text for an archive snippet, not a renderer."""
+    import html as _html
+    txt = re.sub(r"(?is)<(script|style).*?</\1>", " ", html)
+    txt = re.sub(r"(?i)<br\s*/?>", "\n", txt)
+    txt = re.sub(r"(?i)</(p|div|li|tr|h[1-6]|blockquote)\s*>", "\n", txt)
+    txt = re.sub(r"<[^>]+>", "", txt)
+    txt = _html.unescape(txt)             # one pass: &amp;lt; must stay &lt;
+    txt = re.sub(r"[ \t]+\n", "\n", txt)
+    return re.sub(r"\n{3,}", "\n\n", txt).strip()
+
+
+def _gmail_header(payload, name):
+    for h in ((payload or {}).get("headers") or []):
+        if (h.get("name") or "").lower() == name.lower():
+            return h.get("value") or ""
+    return ""
+
+
+FETCH_ERR = "BACKFILL-FETCH-ERROR"
+GONE = "api-unrecoverable"
+_LAST_ERR = []
+_LAST_ID = []
+
+
+def _why():
+    """Why the last fetch produced nothing. Reporting every failure as
+    "deleted" told the operator 25 messages were gone when the real cause was
+    an expired OAuth token."""
+    return _LAST_ERR[0] if _LAST_ERR else "fetch failed -- try again later"
+
+
+def _run(cmd, timeout=60):
+    """Merged stdout+stderr, never raises. A missing binary, a non-zero exit
+    and a timeout all come back as text the caller simply fails to parse."""
+    import subprocess
+    del _LAST_ERR[:]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout)
+        out = ((r.stdout or "") + (r.stderr or ""))[:4_000_000]
+        if r.returncode:
+            _LAST_ERR.append("%s exited %d: %s"
+                             % (os.path.basename(cmd[0]), r.returncode,
+                                " ".join(out.split())[:90] or "no output"))
+        return out
+    except Exception as e:
+        # a timeout still carries whatever arrived before the clock ran out
+        partial = "".join(str(getattr(e, k, "") or "")
+                          for k in ("stdout", "stderr"))
+        _LAST_ERR.append("%s: %s" % (os.path.basename(cmd[0]), e))
+        return "%s %s\n%s" % (FETCH_ERR, e, partial)
+
+
+def _gws(account, args):
+    """argv for one gws call; account None = the main login, exactly `gws ...` as before."""
+    if not account:
+        return ["gws"] + list(args)
+    if GA is None:        # never fall back to the main login for an account's message
+        raise RuntimeError("gmail_accounts.py is missing: cannot reach %s" % account)
+    return GA.gws_argv(account, args)
+
+
+def _get_gmail(msg_id, timeout=60, account=None):
+    """-> (payload dict or None, gone).
+
+    `gone` means the account answered and the message is not there — a 404 or
+    a rejected id. A timeout, a missing `gws` or a login prompt is NOT gone:
+    marking those permanent would bury a message that a later run could still
+    recover.
+    """
+    # `account` = the row's Gmail account when it was sent from an ADDED one: asking the main
+    # mailbox for that id answers 404, which would bury the row as gone for ever.
+    blob = _run(_gws(account, ["gmail", "users", "messages", "get", "--params",
+                               json.dumps({"userId": "me", "id": msg_id,
+                                           "format": "full"})]), timeout=timeout)
+    if blob.startswith(FETCH_ERR):
+        return None, False
+    seen = False
+    for d in C.json_objects(blob, cap=6, scan=4_000_000):
+        seen = True
+        if isinstance(d.get("payload"), dict):
+            return d["payload"], False
+        err = d.get("error")
+        if isinstance(err, dict) and err.get("code") in (404, 410):
+            # ONLY "it is not there". 401/403/429/5xx are an expired token, a
+            # revoked scope or a rate limit -- marking those permanent buried
+            # up to --limit real client emails as unrecoverable on the first
+            # run after a token expired, and every later run then skipped them.
+            return None, True
+        if err is not None:
+            _LAST_ERR.append("gmail refused the fetch: %s"
+                             % json.dumps(err)[:120])
+            return None, False
+    return None, False
+
+
+def _fetch_slack(channel, ts, timeout=60):
+    """Slack history is queried by channel, then matched on the EXACT ts the
+    send returned.
+
+    `history` prints one JSON object per LINE (slack_bridge.py:174-182), not a
+    `{"messages": [...]}` envelope, and its `channel` field is the channel
+    NAME. So the channel id is only usable in the query and the row is
+    identified by `ts` alone.
+    """
+    script = C.channel_cli("slack")
+    try:
+        since = str(int(float(ts)) - 2)
+    except Exception:
+        since = "0"
+    blob = _run(["python3", script, "history", channel, "-n", "60",
+                 "--since", since], timeout=timeout)
+    if blob.startswith(FETCH_ERR):
+        return None, False
+    # The bridge reports its own failures by raising SystemExit with a prose
+    # message (slack_bridge.py:90,92,116,118) whose text carries a JSON detail
+    # blob -- so the scan below FOUND an object, decided the buffer had aged
+    # past this ts, and stamped a retryable 401 as permanent.
+    m = SLACK_ERR_RE.search(blob)
+    if m:
+        _LAST_ERR.append("the slack bridge refused the fetch: %s"
+                         % " ".join(m.group(0).split())[:110])
+        return None, False
+    seen = False
+    for d in C.json_objects(blob, cap=400, scan=4_000_000):
+        seen = True
+        if str(d.get("ts")) != str(ts):
+            continue
+        t = d.get("text")
+        return (t, False) if isinstance(t, str) and t.strip() else (None, True)
+    # the bridge answered but this ts is not in its buffer any more, and the
+    # buffer only ages forward — retrying tomorrow cannot help
+    return None, bool(seen)
+
+
+# Every way slack_bridge.py reports a failure instead of a conversation.
+SLACK_ERR_RE = re.compile(
+    r"^Slack bridge (?:HTTP \d+|unreachable\b).*"
+    r"|^BRIDGE_API_KEY missing\b.*", re.M)
+
+
+def _emails(value):
+    return set(re.findall(r"[\w.+-]+@[\w-]+\.[\w.-]+", value or ""))
+
+
+def _candidates(row):
+    """Every send receipt in this row's output blob.
+
+    One Bash call can hold several sends and the hook stores ONE merged output
+    on every row it produced, so a row's `body` may name a message that is not
+    this row's. Return them all and let the caller scope.
+    """
+    out = []
+    for d in C.json_objects(row.get("body") or "", cap=40):
+        if row["channel"] == "gmail" and isinstance(d.get("id"), str):
+            if d["id"] not in out:
+                out.append(d["id"])
+        elif row["channel"] == "slack" and d.get("ts") and d.get("channel"):
+            pair = (str(d["channel"]), str(d["ts"]))
+            if pair not in out:
+                out.append(pair)
+    return out
+
+
+def _resolve(row, timeout=60):
+    """-> (text, note, gone). Refuses to guess when a shared blob is ambiguous.
+
+    `gone` marks a row worth never asking about again. An ambiguous blob is
+    NOT gone — it is a scoping limit, not a missing message.
+    """
+    del _LAST_ID[:]
+    cands = _candidates(row)
+    if not cands:
+        return None, "no send receipt in the stored output", True
+    want = {str(row.get("target") or "").lower(),
+            str(row.get("raw_target") or "").lower()}
+    want.discard("")
+
+    if row["channel"] == "slack":
+        hits = [c for c in cands if c[0].lower() in want]
+        if not hits:
+            hits = cands if len(cands) == 1 else []
+        if len(hits) != 1:
+            # permanent, not transient: the body and the target are both
+            # frozen on the row, so no later run can attribute it either
+            return None, ("cannot tell which of %d sends in this output is "
+                          "%s" % (len(cands), row.get("target"))), True
+        text, gone = _fetch_slack(hits[0][0], hits[0][1], timeout)
+        _LAST_ID[:] = ["%s@%s" % (hits[0][1], hits[0][0])]
+        return text, ("not in the bridge's buffer any more" if gone else
+                      _why()), gone
+
+    # gmail: the send receipt is {id, threadId, labelIds} and names nobody, so
+    # with several in one blob the only way to tell them apart is to read each
+    # one's To: header back and match this row's recipient.
+    # EVERY candidate is header-checked, including a lone one. Chaining two
+    # sends where only the first printed a receipt leaves both rows holding
+    # that one receipt -- and an unchecked single candidate then wrote one
+    # client's email into another client's row, and into their repo mirror.
+    matched, seen, gones = [], [], []
+    for mid in cands:
+        pl, gone = _get_gmail(mid, timeout, account=row.get("account"))
+        gones.append(gone)
+        if pl is None:
+            continue
+        seen.append(pl)                   # kept so the note below can reuse it
+        got = _emails(_gmail_header(pl, "To") + " " +
+                      _gmail_header(pl, "Cc") + " " +
+                      _gmail_header(pl, "Bcc"))
+        if got & want:
+            matched.append((mid, pl))
+    # permanent only when EVERY fetch said "not there". A transient failure --
+    # an expired token, `gws` off PATH -- must stay retryable.
+    gone_all = bool(gones) and all(gones)
+    # ...and "we looked at every candidate and none was this row's" is the only
+    # OTHER permanent answer. Without it a single 429 on the second of two
+    # receipts stamped the row `api-unrecoverable` and it was never asked
+    # about again.
+    # A candidate that 404'd is definitively answered even though it returned
+    # no payload. Counting only payloads left "one gone + one wrong recipient"
+    # looking retryable, so `backfill --apply` re-fetched it on every run for
+    # ever and always exited non-zero.
+    resolved_all = (len(seen) + sum(1 for g in gones if g) == len(cands))
+    if not seen:
+        return None, ("no longer in the mailbox" if gone_all else _why()), \
+            gone_all
+    if len(matched) != 1:
+        if len(cands) == 1 and not matched:
+            # `seen[0]` is the payload already fetched in the loop above --
+            # re-fetching it here doubled the API cost of every such row
+            went = _emails(_gmail_header(seen[0], "To")) if seen else set()
+            return None, ("the one send in this output went to %s, not %s"
+                          % (", ".join(sorted(went)) or "someone else",
+                             row.get("target"))), (resolved_all or gone_all)
+        return None, ("cannot tell which of %d sends in this output is %s "
+                      "(%d matched)"
+                      % (len(cands), row.get("target"), len(matched))), \
+            (resolved_all or gone_all)
+    _LAST_ID[:] = [matched[0][0]]
+    body = _gmail_body(matched[0][1])
+    return body, (None if body else "message has no text part"), not body
+
+
+def _read_rows(path):
+    """-> (entries, size). An entry is (obj_or_None, raw_line).
+
+    The raw line is kept even when it will not parse: this file is the durable
+    record, and a rewrite that silently drops a line nobody could parse is
+    exactly the data loss the archive exists to prevent. `size` is the byte
+    length read, so a concurrent append can be preserved at write time.
+    """
+    entries = []
+    with open(path, "rb") as fh:
+        blob = fh.read()
+    size = len(blob)
+    for raw in blob.decode("utf-8", "replace").splitlines():
+        if not raw.strip():
+            continue
+        try:
+            entries.append([json.loads(raw), raw])
+        except Exception:
+            entries.append([None, raw])
+    return entries, size
+
+
+def _rewrite(path, entries, size):
+    """Replace `path` with `entries`, keeping anything appended since.
+
+    The hook appends to this same file with no lock (`append_jsonl_many` relies
+    on O_APPEND being atomic), so a lock here cannot stop it. Instead the bytes
+    past our snapshot offset are read back and carried over verbatim.
+
+    The big write happens BEFORE the lock, so the only work inside it is a
+    small tail read, a small append, an fsync and the rename. Measured on a
+    16 MB month file the in-lock window was 162 ms with the body write inside;
+    this is the difference between "a hook append is sometimes lost" and
+    "almost never". It cannot be made zero without locking the hook's hot path,
+    which is what blew the 10 second budget in the first place.
+    """
+    blob = "".join(
+        (json.dumps(o, ensure_ascii=False) if o is not None else raw) + "\n"
+        for o, raw in entries).encode("utf-8", "replace")
+    tmp = "%s.bf.%d" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fh = os.fdopen(fd, "wb")
+    tail = b""
+    try:
+        fh.write(blob)
+        fh.flush()
+        with C.filelock(path):
+            try:
+                with open(path, "rb") as src:
+                    src.seek(size)
+                    tail = src.read()
+            except Exception:
+                tail = b""
+            if tail:
+                fh.write(tail)
+            fh.flush()
+            # without this a crash after the rename can leave a month file
+            # that the directory entry says is complete and the disk does not
+            os.fsync(fh.fileno())
+            fh.close()
+            os.replace(tmp, path)
+    finally:
+        try:
+            if not fh.closed:
+                fh.close()
+        except Exception:
+            pass
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+    return len(tail)
+
+
+def _rewrite_note():
+    """Tell the operator when another `comms` is mid-rewrite.
+
+    `cmd_backfill` holds the mutex across its network calls, so a `reindex`
+    started meanwhile can wait many minutes. Blocking in silence looks like a
+    hang; this prints one line first.
+    """
+    import fcntl
+    # `filelock` FAILS OPEN by design, so an absent or unwritable ROOT would
+    # silently unserialise all three rewriters instead of erroring. Only the
+    # hook used to create this directory; `comms` never did.
+    C.secure_dir(C.ROOT)
+    lock = os.path.join(C.ROOT, "rewrite.lock")
+    try:
+        fh = open(lock, "a")
+        # every other file this tree creates is 0600; this one was 0644 when
+        # the probe happened to be what created it
+        os.chmod(lock, 0o600)
+    except Exception as e:
+        # `filelock` fails OPEN by design so the hook can never be blocked.
+        # That means a lock file which cannot even be created leaves all three
+        # rewriters unserialised -- and staying quiet about it looked exactly
+        # like "no contention". Say it out loud.
+        print("warning: cannot create %s (%s)\n"
+              "         concurrent `comms` rewrites will NOT be serialised"
+              % (lock, e))
+        return
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    except Exception:
+        print("waiting: another `comms` is rewriting the store "
+              "(a backfill can hold it for several minutes)...")
+    finally:
+        try:
+            fh.close()
+        except Exception:
+            pass
+
+
+def _rewrite_lock():
+    """Serialise everything that REWRITES the store.
+
+    `_read_rows` snapshots a byte offset and `_rewrite` trusts it, so two
+    `comms` processes overlapping would have one seek into the middle of the
+    other's row and splice a torn line in. The hook never takes this lock, so
+    capture is never blocked by a backfill that is waiting on the network.
+    """
+    C.secure_dir(C.ROOT)          # see `_rewrite_note` -- filelock fails open
+    return C.filelock(os.path.join(C.ROOT, "rewrite"))
+
+
+def _sync_mirrors(patched):
+    """Push backfilled text into the per-project repo mirrors too.
+
+    `<repo>/.communications/YYYY-MM.jsonl` is a COPY of the central row, so
+    filling only the central store would leave the repo mirror — the copy a
+    human actually opens next to the client's code — still showing an empty
+    send. The mirror row is the SAME dict the central store got, so it is
+    matched on (ts, channel, target, command): target alone is not unique, and
+    neither is ts, since two sends to one person inside the same millisecond
+    round to the same value.
+    """
+    if not patched:
+        return 0
+    routes = C._load(C.ROUTES, {}) or {}
+    by_file, missed = {}, []
+    for row in patched:
+        hit = C.route(row.get("target"), routes) or {}
+        path = hit.get("path")
+        if not path or not os.path.isdir(path):
+            # routed but the repo has moved or been deleted -- say so, rather
+            # than leaving that project's mirror quietly stale forever
+            if hit.get("project") or row.get("project"):
+                # no path to suggest: the one on record no longer exists,
+                # so re-routing to it would fail the same way
+                missed.append((row, hit.get("project") or row.get("project"),
+                               None))
+            continue
+        proj = hit.get("project") or row.get("project")
+        month = (row.get("et") or "")[:7] or time.strftime(
+            "%Y-%m", time.localtime(row.get("ts") or time.time()))
+        f = os.path.join(path, C.DIR_NAME, month + ".jsonl")
+        if os.path.exists(f):
+            key = (row.get("ts"), row.get("channel"), row.get("target"),
+                   row.get("command"))
+            by_file.setdefault(f, {}).setdefault(key, []).append(
+                (row, proj, path))
+        else:
+            missed.append((row, proj, path))
+    n = 0
+    for f, wanted in by_file.items():
+        entries, size = _read_rows(f)
+        dirty, filled_here = False, 0
+        for e in entries:
+            o = e[0]
+            if not o or o.get("text"):
+                continue
+            key = (o.get("ts"), o.get("channel"), o.get("target"),
+                   o.get("command"))
+            queue = wanted.get(key)
+            if not queue:
+                continue
+            # ts is rounded to the millisecond and `command` is the redacted
+            # segment, so two identical sends chained in one line share a key.
+            # Consume the matches IN ORDER instead of giving every row the
+            # last one's words.
+            src = queue.pop(0)[0]
+            o["text"] = src["text"]
+            o["text_source"] = src["text_source"]
+            o["text_id"] = src.get("text_id")
+            dirty, n, filled_here = True, n + 1, filled_here + 1
+        if dirty:
+            try:
+                _rewrite(f, entries, size)
+            except Exception as e:
+                # a client code tree can be read-only, so an
+                # unwritable mirror is a real case. One of them must not throw
+                # away the other mirrors -- or the `applied:` summary line --
+                # after the whole run's network calls are already spent.
+                # Back out only what THIS file would have gained: subtracting
+                # every row in it that had text also erased rows filled on
+                # earlier runs, and the count read 0 whenever a broken mirror
+                # already held one.
+                print("  could not update the mirror %s: %s" % (f, e))
+                n -= filled_here
+    for f, wanted in by_file.items():
+        for queue in wanted.values():
+            missed.extend(queue)           # never consumed: no matching row
+    seen = set()
+    for row, proj, path in missed:
+        k = (row.get("target"), proj)
+        if k in seen:
+            continue
+        seen.add(k)
+        # the repo path is known in both branches above, so print the command
+        # the owner can paste. A literal `<repo>` placeholder is not a command.
+        print("  note: %s is filed under %s but its repo mirror has no row to "
+              "update -- run `comms route %s %s%s` again to rebuild it"
+              % (row.get("target"), proj, row.get("target"), proj,
+                 (" --path %s" % path) if path else ""))
+    return n
+
+
+def cmd_backfill(a):
+    _rewrite_note()
+    with _rewrite_lock():
+        return _backfill(a)
+
+
+def _backfill(a):
+    """Fetch the words for sends that never had them on the command line.
+
+    Neither Slack nor Gmail writes the sent text to disk (verified in source
+    2026-09-09): Slack's send returns {ok, ts, channel}, Gmail's returns
+    {id, threadId, labelIds}. So when the body came from a shell variable the
+    only surviving copy is the message itself, and getting it means a network
+    call — which must never happen inside the hook's 10 second budget. Hence a
+    separate, explicit, opt-in command.
+
+    Strictly read-only against the accounts: `gmail users messages get` and the
+    bridge's `history`. It cannot send.
+    """
+    want = {"gmail", "slack"} if not a.channel else {a.channel}
+    limit = a.limit if a.limit and a.limit > 0 else None
+    todo, files, skipped = [], {}, 0
+    for path in sorted(glob.glob(os.path.join(C.STORE, "*.jsonl"))):
+        entries, size = _read_rows(path)
+        files[path] = [entries, size, False]
+        for i, (r, _raw) in enumerate(entries):
+            if not r or r.get("text") or r.get("dir") != "send":
+                continue
+            if r.get("channel") not in want:
+                continue
+            # a row already checked and found gone stays checked. Without this
+            # every future run re-asks the API about the same dead message,
+            # forever, with no cap.
+            if r.get("text_source") == GONE and not a.retry_failed:
+                skipped += 1
+                continue
+            todo.append((path, i, r))
+    # NEWEST first. Slack's `history` is a buffered cache, so the oldest sends
+    # are exactly the ones that will not come back -- taking the oldest N meant
+    # a wall of dead rows at the head that the recoverable ones sat behind.
+    todo.sort(key=lambda t: t[2].get("ts") or 0, reverse=not a.oldest_first)
+    if limit:
+        todo = todo[:limit]
+    if not todo:
+        print("nothing to backfill: every %s send either has its text or was "
+              "already checked" % "/".join(sorted(want)))
+        if skipped:
+            print("(%d marked unrecoverable on an earlier run -- "
+                  "`--retry-failed` asks again)" % skipped)
+        return 0
+
+    print("%d send(s) missing text%s\n   one network call each, up to "
+          "%d min if every one times out\n"
+          % (len(todo), "" if a.apply else "   (plan only -- add --apply "
+                                           "to write)",
+             max(1, (len(todo) * a.timeout + 59) // 60)))
+    filled, gone_n, patched, stalled = 0, 0, [], 0
+    interrupted = False
+    for path, i, r in todo:
+        try:
+            text, note, gone = _resolve(r, timeout=a.timeout)
+        except KeyboardInterrupt:
+            # everything recovered so far is still written. Losing 20 minutes
+            # of fetches to the natural reaction to a slow run is worse than
+            # a partial pass.
+            interrupted = True
+            print("\n  interrupted -- keeping what was already recovered")
+            break
+        who = r.get("label") or r.get("target")
+        head = "  %-6s %-24s" % (r.get("channel"), str(who)[:24])
+        if text and text.strip():
+            filled += 1
+            print("%s %s" % (head, repr(" ".join(text.split())[:60])))
+            if a.apply:
+                obj = files[path][0][i][0]
+                obj["text"] = C.redact(text[:C.BODY_CAP])
+                obj["text_source"] = "api-backfill"
+                # which message this came from, so a wrong fill is auditable
+                obj["text_id"] = _LAST_ID[0] if _LAST_ID else None
+                if len(text) > C.BODY_CAP:
+                    obj["truncated"] = True
+                files[path][2] = True
+                patched.append(obj)
+        else:
+            print("%s -- %s%s" % (head, note or "no text in the message",
+                                  "" if not gone else "  [won't retry]"))
+            if gone:
+                gone_n += 1
+                if a.apply:
+                    files[path][0][i][0]["text_source"] = GONE
+                    files[path][2] = True
+            else:
+                stalled += 1
+
+    if a.apply:
+        carried, wrote = 0, 0
+        for path, (entries, size, dirty) in files.items():
+            if not dirty:
+                continue
+            try:
+                carried += _rewrite(path, entries, size)
+                wrote += 1
+            except Exception as e:
+                # keep going: the other months are already fetched, and losing
+                # them to one bad write wastes every network call in this run
+                print("  could not write %s: %s" % (os.path.basename(path), e))
+        try:
+            mirrored = _sync_mirrors(patched)
+        except Exception as e:
+            # the central store is already written and fsynced; a mirror is a
+            # rebuildable copy, so it never gets to hide the summary
+            print("  could not sync the project mirrors: %s" % e)
+            mirrored = 0
+        print("\napplied: %d of %d recovered%s%s%s"
+              % (filled, len(todo),
+                 "" if not gone_n else
+                 ", %d marked unrecoverable" % gone_n,
+                 "" if not mirrored else
+                 ", %d also updated in a project mirror" % mirrored,
+                 "" if not carried else
+                 "  (%d bytes appended during the run were kept)" % carried))
+    else:
+        print("\nplan: %d of %d recoverable -- re-run with --apply to write"
+              % (filled, len(todo)))
+    if skipped:
+        print("(%d skipped: marked unrecoverable earlier -- `--retry-failed` "
+              "asks again)" % skipped)
+    # a stalled row is the actionable kind of failure -- an expired token,
+    # `gws` off PATH, the bridge down -- so it must not look like a clean run
+    return 1 if (stalled or interrupted) else 0
+
+
+def _help_subcommands(text):
+    """Subcommand names out of an argparse --help: the {a,b,c} group, else None."""
+    import re as _re
+    blob = text.replace("\n", " ")
+    m = _re.search(r"positional arguments:\s*\{([A-Za-z0-9,_\-]+)\}", blob)
+    m = m or _re.search(r"\{([A-Za-z0-9,_\-]+)\}", blob)
+    return set(m.group(1).split(",")) if m else None
+
+
+def _check_plugins():
+    """One doctor line per plug-in channel (channel.json beside its program), like the built-in
+    channels get. A manifest that cannot be used is one CHECK line; nothing else stops. -> problems"""
+    import subprocess
+    problems = 0
+    for warning in C.channel_manifest_warnings():
+        print("plugin    CHECK  %s" % warning)
+        problems += 1
+    for man in C.channel_manifests():
+        name = man["name"]
+        label = "%-9s" % name
+        if man["kind"] != "python-cli":
+            print("%s ok     %s channel: manifest read, not probed" % (label, man["kind"]))
+            continue
+        if not os.path.exists(man["entry_path"]):
+            print("%s CHECK  %s is missing" % (label, man["entry_path"]))
+            problems += 1
+            continue
+        try:
+            r = subprocess.run([sys.executable, man["entry_path"], "--help"],
+                               capture_output=True, text=True, timeout=30, cwd=man["dir"])
+        except Exception as e:  # noqa: BLE001
+            print("%s PROBE FAILED: %s" % (label, e))
+            problems += 1
+            continue
+        real = _help_subcommands(r.stdout + r.stderr)
+        if real is None:
+            print("%s PROBE FAILED: no subcommand list in --help (rc=%s)" % (label, r.returncode))
+            problems += 1
+            continue
+        known = set(man["verbs"])
+        skipped = set(man["ignored"]) | set(man["blocked"])
+        new = sorted(real - known - skipped)
+        ghost = sorted(known - real)
+        status = "ok" if not new and not ghost else "CHECK"
+        print("%s %-6s %d logged + %d skipped on purpose / %d in CLI"
+              % (label, status, len(known & real), len(skipped & real), len(real)))
+        if new:
+            print("          UNCLASSIFIED (never logged): %s" % ", ".join(new))
+        if ghost:
+            print("          in map but gone from CLI: %s" % ", ".join(ghost))
+        problems += 1 if (new or ghost) else 0
+    return problems
+
+
+def cmd_doctor(a):
+    """Diff the verb map against each CLI's live --help.
+
+    Both the iMessage and the Gmail CLIs grew new send verbs under this tool on
+    2026-09-09, and an unclassified send verb means messages are silently never
+    archived. Re-run this after any comms CLI update.
+    """
+    import re as _re, subprocess
+    probes = {
+        "imessage": [C.channel_cli("imessage"), "--help"],
+        "whatsapp": ["python3", C.channel_cli("whatsapp"), "--help"],
+        "slack": ["python3", C.channel_cli("slack"), "--help"],
+    }
+    problems = 0
+    for chan, cmd in probes.items():
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except Exception as e:
+            print("%-9s PROBE FAILED: %s" % (chan, e)); problems += 1; continue
+        blob = (r.stdout + r.stderr).replace("\n", " ")
+        m = _re.search(r"\{([a-z0-9,\-_]+)\}", blob)
+        if not m:
+            print("%-9s PROBE FAILED: no subcommand list in --help (rc=%s)"
+                  % (chan, r.returncode)); problems += 1; continue
+        real = set(m.group(1).split(","))
+        known = set(C.VERBS[chan])
+        skipped = C.IGNORED.get(chan, set())
+        new = sorted(real - known - skipped)
+        ghost = sorted(known - real)
+        status = "ok" if not new and not ghost else "CHECK"
+        print("%-9s %-6s %d logged + %d skipped on purpose / %d in CLI" %
+              (chan, status, len(known & real), len(skipped & real), len(real)))
+        if new:
+            print("          UNCLASSIFIED (never logged): %s" % ", ".join(new))
+            problems += 1
+        if ghost:
+            print("          in map but gone from CLI: %s" % ", ".join(ghost))
+    problems += _check_plugins()
+    # gws is a different shape - probe its two paths separately
+    try:
+        r = subprocess.run(["gws", "gmail", "--help"], capture_output=True,
+                           text=True, timeout=30)
+        helpers = set(_re.findall(r"^\s+(\+[a-z-]+)", r.stdout, _re.M))
+        known = set(v for v in C.VERBS["gmail"] if v.startswith("+"))
+        new = sorted(helpers - known)
+        print("%-9s %-6s %d helper verbs mapped / %d in CLI" %
+              ("gmail", "ok" if not new else "CHECK", len(known & helpers),
+               len(helpers)))
+        if new:
+            print("          UNCLASSIFIED (never logged): %s" % ", ".join(new))
+            problems += 1
+    except FileNotFoundError:
+        print("gmail     skip   gws is not installed (only Gmail needs it)")
+    except Exception as e:
+        print("gmail     PROBE FAILED: %s" % e); problems += 1
+    # Added Gmail accounts (gmail_accounts.py): the wrapper must exist and the hook must still
+    # recognise a send made through it, or those sends are never archived.
+    try:
+        accts = _gmail_accounts()
+        if accts:
+            runnable = bool(GA) and os.access(GA.gws_as_path(), os.X_OK)
+            seen = any(ch == "gmail" for ch, _s in
+                       C.detect_all("gws-as %s gmail +send --to a@example.com --body x" % accts[0]))
+            good = runnable and seen
+            print("%-9s %-6s %d added account(s); gws-as %s; hook %s" %
+                  ("gmail-acct", "ok" if good else "CHECK", len(accts),
+                   "runs" if runnable else "MISSING", "sees its sends" if seen else "DOES NOT see its sends"))
+            problems += 0 if good else 1
+    except Exception as e:
+        print("gmail-acct PROBE FAILED: %s" % e); problems += 1
+    # The iMessage text recovery reads pi-2's OWN preview store, which is
+    # another tool's private state. If pi-2 changes its layout, recovery stops
+    # silently and `--text-file "$VAR/x.txt"` sends lose their words again.
+    store = os.path.join(C.PI_PREVIEWS, C.PREVIEW_SENT)
+    try:
+        if not os.path.isdir(os.path.join(C.HOME, ".pi-2")):
+            print("previews  skip   no pi-2 on this machine (only its iMessage wrapper uses them)")
+        elif not os.path.isdir(store):
+            print("previews  MISSING: %s" % store)
+            print("          iMessage sends whose text came from a shell "
+                  "variable will record no text")
+            problems += 1
+        else:
+            files = [f for f in os.listdir(store) if f.endswith(".json")]
+            ok = bad = 0
+            for f in sorted(files)[-25:]:
+                pl = C.preview_payload(f[:-5])
+                if C.payload_texts(pl):
+                    ok += 1
+                else:
+                    bad += 1
+            status = "ok" if ok and not bad else "CHECK"
+            print("previews  %-6s %d readable / %d sampled of %d stored"
+                  % (status, ok, ok + bad, len(files)))
+            if bad:
+                print("          %d had no readable text: pi-2 may have "
+                      "changed its payload schema" % bad)
+                problems += 1
+            elif not files:
+                print("          store is empty - nothing to verify against")
+    except Exception as e:
+        print("previews  PROBE FAILED: %s" % e)
+        problems += 1
+    # The whole archive depends on ONE hook registration. Edit settings.json,
+    # or move the hook file, and capture stops with no error anywhere -- the
+    # exact silent failure this command exists to catch.
+    problems += _check_hook()
+    print("\n%s" % ("all comms CLIs fully classified" if not problems
+                    else "%d thing(s) need attention - edit VERBS in %s, or "
+                         "see the lines marked CHECK above"
+                         % (problems, os.path.join(CORE, "commslib.py"))))
+    return 1 if problems else 0
+
+
+def _hook_path():
+    """The capture hook: COMMS_KIT_HOOK, ~/.claude/hooks (the installed layout), then the repo's
+    integrations/claude-code folder beside core."""
+    repo_copy = os.path.join(CORE, "..", "integrations", "claude-code", "comms-log.py")  # kit: code path
+    candidates = (os.environ.get("COMMS_KIT_HOOK"),
+                  os.path.expanduser("~/.claude/hooks/comms-log.py"), repo_copy)
+    for path in candidates:
+        if path and os.path.exists(path):
+            return os.path.abspath(path)
+    return os.path.expanduser("~/.claude/hooks/comms-log.py")
+
+
+HOOK = _hook_path()
+# where to ADD a registration when there is none
+SETTINGS = os.path.expanduser("~/.claude/settings.json")
+# The literal tool names that must be covered. Read out of `MCP_TOOLS` in
+# commslib rather than written from memory -- the names carry a DOUBLED
+# `upwork__` (the server is `upwork`, the tool is `upwork__send_message`) and
+# a hand-typed `mcp__upwork__send_message` checks coverage of a tool that does
+# not exist.
+# `getattr`, not `C.MCP_TOOLS`: this runs at import time, and a library too
+# old to have the table would raise here -- past the import guard, so the
+# doctor would traceback on exactly the broken install it exists to report.
+WANT_TOOLS = ("Bash",) + tuple(sorted(getattr(C, "MCP_TOOLS", ()) or ()))
+# A matcher made only of these characters is compared as an EXACT string, or a
+# `|`/`,` separated list of exact strings. Anything else is a JavaScript regex,
+# searched UNANCHORED. (Claude Code hooks reference, confirmed 2026-09-09.)
+# The old code took every matcher as a regex and also accepted a bare prefix,
+# so `mcp__upwork__` was reported as covering `mcp__upwork__send_message` --
+# which it does not -- while `^mcp__upwork__`, which does, was reported broken.
+SIMPLE_MATCHER_RE = re.compile(r"^[A-Za-z0-9_\- |,]*$")
+
+def _payload(command, stdout, tool="Bash", tool_input=None):
+    return json.dumps({
+        "tool_name": tool, "cwd": "/tmp", "session_id": "doctor",
+        "tool_input": (tool_input if tool_input is not None
+                       else {"command": command}),
+        "tool_response": {"stdout": stdout, "stderr": ""}})
+
+
+# ONE probe per CHANNEL, because a version skew does not have to break them
+# all. Measured 2026-09-09: an old library paired with a new hook archived an
+# iMessage send perfectly and lost every Gmail row -- and a single iMessage
+# probe reported `ok archived a probe send end to end` while Gmail capture was
+# dead. A liveness check that skips a path proves nothing about that path.
+# the owner's own address, so the gmail probe has a header it can tell from the correspondent's
+PROBE_OWNER = next(iter(sorted(C.self_emails())), "owner@example.com")
+# None of these commands is ever EXECUTED; the hook only parses the string.
+PROBE_CASES = (
+    ("imessage",
+     _payload("/opt/probe/imessage send --chat-id 0 "
+              "--text 'comms doctor self-test'",
+              '{"status": "sent_and_verified", "chat_id": "0", '
+              '"parts": ["comms doctor self-test"], '
+              '"sent": [{"bubble": 1, "kind": "text"}]}')),
+    ("whatsapp",
+     _payload('python3 /opt/probe/whatsapp/whatsapp_mautrix.py'
+              ' send "!doctorprobe:example.invalid" "comms doctor self-test" --yes',
+              'About to send to "probe" [room !doctorprobe:example.invalid] : '
+              '"comms doctor self-test"\nSent. event_id=$doctorprobe')),
+    ("slack",
+     _payload('python3 /opt/probe/slack/slack_bridge.py'
+              ' send C0DOCTOR01 "comms doctor self-test" --yes',
+              '{"ok": true, "channel": "C0DOCTOR01", "ts": "1.0"}')),
+    ("gmail",
+     _payload("gws gmail +read --message-id 18f0aa00bb11cc33 2>&1",
+              "From: Probe Person <probe@example.com>\n"
+              "To: Owner <%s>\n" % PROBE_OWNER +
+              "Date: Tue, 9 Sep 2026 10:00:00 -0400\nSubject: probe\n\nhi")),
+    ("upwork",
+     _payload(None, "", tool="mcp__upwork__upwork__send_message",
+              tool_input={"action": "send",
+                          "params": {"room_id": "doctorprobe",
+                                     "message": "comms doctor self-test"}})),
+)
+# the registration check only asks "did running this entry reach the hook", so
+# one channel answers it; the full sweep belongs to the liveness check
+PROBE_PAYLOAD = PROBE_CASES[0][1]
+
+
+def _settings_files():
+    """Every file Claude Code can register a PostToolUse hook in.
+
+    Hooks MERGE across all of them, so a registration in ANY layer counts.
+    Reading only `~/.claude/settings.json` reported a hook that lives one layer
+    up as "not registered" and sent the operator to edit a correct file.
+    """
+    # Claude Code resolves project settings from the session's primary working
+    # directory and `settings.local.json` from the git repo root, not from
+    # wherever `comms` was invoked -- run from a subdirectory of your own repo
+    # and the old code said capture was dead.
+    here = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    root = _git_root(here) or here
+    # (path, trusted). TRUSTED means "we are willing to RUN this entry".
+    # A `<cwd>/.claude/settings.json` belongs to whatever repo you happen to
+    # be standing in -- a client code tree is other people's code --
+    # and `_entry_live` runs the string with `shell=True` and the real
+    # environment. A cloned repo could make `comms doctor` run anything. Those
+    # layers are still READ, so a registration there is not reported missing;
+    # they are just never executed.
+    paths = [("/Library/Application Support/ClaudeCode/managed-settings.json",
+              True),
+             (os.path.join(here, ".claude", "settings.local.json"), False),
+             (os.path.join(here, ".claude", "settings.json"), False),
+             (os.path.join(root, ".claude", "settings.local.json"), False),
+             (os.path.join(root, ".claude", "settings.json"), False),
+             (os.path.expanduser("~/.claude/settings.local.json"), True),
+             (os.path.expanduser("~/.claude/settings.json"), True),
+             (os.path.expanduser("~/.claude.json"), True)]
+    # Run from the home directory and `<cwd>/.claude/settings.json` IS
+    # `~/.claude/settings.json`. Read twice, every entry was counted twice and
+    # every probe ran twice: `registered for Bash, Bash, mcp__upwork__.*,
+    # mcp__upwork__.*`. Dedupe on the resolved path, keeping layer order.
+    # Trust MERGES across duplicates. Run from the home directory and
+    # `<cwd>/.claude/settings.json` resolves to `~/.claude/settings.json` --
+    # the same file, listed once as a repo file and once as ours. Keeping
+    # whichever came first marked the owner's own settings untrusted and refused
+    # to run it.
+    trust = {}
+    for path, trusted in paths:
+        try:
+            key = os.path.realpath(path)
+        except Exception:
+            key = path
+        trust[key] = trust.get(key, False) or trusted
+    out, seen = [], set()
+    for path, _t in paths:
+        try:
+            key = os.path.realpath(path)
+        except Exception:
+            key = path
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((path, trust[key]))
+    return out
+
+
+def _git_root(start):
+    d = os.path.abspath(start)
+    for _ in range(40):
+        if os.path.isdir(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+    return None
+
+
+def _matcher_covers(matcher, tool):
+    """Would this settings.json `matcher` fire on this tool name?"""
+    if matcher is None:
+        return True                       # absent means match-all
+    if not isinstance(matcher, str):
+        # `str(["Bash"])` is `"['Bash']"`, which Python reads as a character
+        # class and happily "matches"
+        return False
+    m = matcher
+    if m in ("", "*"):
+        return True
+    if SIMPLE_MATCHER_RE.match(m):
+        return tool in [p.strip() for p in re.split(r"[|,]", m)]
+    try:
+        return bool(re.search(m, tool))
+    except re.error:
+        return False
+
+
+def _mentions_hook(command, extra=None):
+    """Does this hook command name OUR hook file anywhere?
+
+    This is only a SELECTOR -- it decides which entries are worth running.
+    Whether an entry really runs the hook is settled by RUNNING it, because
+    `# /path/hook.py`, `echo /path/hook.py` and `false && /path/hook.py` all
+    name the file, none of them archive anything, and no static reading of a
+    shell line tells those apart reliably. Commenting the line out is how a
+    person disables a hook by hand, and it used to report `ok`.
+    """
+    try:
+        want = os.path.realpath(HOOK)
+    except Exception:
+        return False
+    raw = str(command or "")
+    # Claude Code always sets $CLAUDE_PROJECT_DIR for a hook; a plain terminal
+    # usually does not, so expanding against OUR environment reported a working
+    # registration as missing.
+    here = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    for name in ("$CLAUDE_PROJECT_DIR", "${CLAUDE_PROJECT_DIR}"):
+        raw = raw.replace(name, here)
+    cmd = os.path.expandvars(raw)
+    try:
+        import shlex
+        toks = shlex.split(cmd)
+    except Exception:
+        toks = cmd.split()
+    # `hook.py; sleep 40 &` glues the `;` onto the path, and one punctuation
+    # mark used to make a live entry invisible
+    more = []
+    for tok in toks:
+        more.extend(re.split(r"[;&|()<>]+", tok))
+    for tok in list(toks) + more + list(extra or []) + [cmd]:
+        try:
+            t = os.path.expanduser(str(tok).strip("\"'").strip())
+            if t and os.path.realpath(t) == want:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _probe(build, payloads=None):
+    """Run hook invocations against a THROWAWAY HOME -> (ok, detail).
+
+    `build(home)` returns `(argv, shell)`. The sandbox gets a copy of the REAL
+    commslib, because an installed pair that has drifted apart is the thing
+    being tested; and the hook resolves every path from $HOME, so it cannot
+    touch the real archive whatever it does.
+    """
+    import subprocess
+    import tempfile
+    import shutil
+    sand = tempfile.mkdtemp(prefix="comms-doctor-")
+    try:
+        lib = os.path.join(sand, ".claude", "communications")
+        os.makedirs(lib)
+        shutil.copy(C.__file__.replace(".pyc", ".py"),
+                    os.path.join(lib, "commslib.py"))
+        shutil.copy(os.path.join(os.path.dirname(os.path.abspath(C.__file__)), "kitconfig.py"),
+                    os.path.join(lib, "kitconfig.py"))
+        # the sandbox archives into its own folder whatever the real config says
+        sand_config = os.path.join(sand, "probe-config.json")
+        with open(sand_config, "w") as fh:
+            json.dump({"data_dir": lib}, fh)
+        # The registration is usually written `$HOME/.claude/hooks/...`, and
+        # the whole point of this sandbox is that $HOME is NOT the real one --
+        # so the hook has to exist at the same place inside it, or every such
+        # entry fails the probe for the sandbox's reasons rather than its own.
+        hooks = os.path.join(sand, ".claude", "hooks")
+        os.makedirs(hooks)
+        copy = os.path.join(hooks, os.path.basename(HOOK))
+        shutil.copy(HOOK, copy)
+        os.chmod(copy, 0o755)
+        argv, shell = build(sand)
+        env = dict(os.environ, HOME=sand, CLAUDE_PROJECT_DIR=sand,
+                   COMMS_KIT_CONFIG=sand_config, COMMS_KIT_CORE=lib)
+        # cwd inside the sandbox too, so a relative path in a hook command
+        # cannot write into whatever directory the operator is standing in
+        cwd = sand
+        cases = payloads or (("send", PROBE_PAYLOAD),)
+        seen = 0
+        for label, payload in cases:
+            try:
+                r = subprocess.run(argv, input=payload, text=True,
+                                   capture_output=True, timeout=30, env=env,
+                                   shell=shell, cwd=cwd,
+                                   start_new_session=True)
+            except subprocess.TimeoutExpired:
+                # it may well have archived; what it did NOT do is finish. A
+                # hook has 10 seconds before Claude Code kills it.
+                return False, ("%s: still running after 30s -- a hook is "
+                               "killed at 10s, so this loses every row of the "
+                               "call" % label)
+            except Exception as e:
+                return False, "%s: will not run: %s" % (label, e)
+            rows = 0
+            for f in glob.glob(os.path.join(lib, "store", "*.jsonl")):
+                with open(f) as fh:
+                    rows += sum(1 for ln in fh if ln.strip())
+            if rows > seen:
+                seen = rows
+                continue
+            why = " ".join(((r.stderr or "")
+                            + (r.stdout or "")).split())[-170:]
+            if r.returncode:
+                return False, "%s: exits %d -- %s" % (label, r.returncode,
+                                                      why or "no output")
+            return False, "%s: ran clean but archived nothing%s" % (
+                label, (" -- " + why) if why else "")
+        return True, ""
+    finally:
+        shutil.rmtree(sand, ignore_errors=True)
+
+
+def _entry_live(h):
+    """Does this settings.json entry actually archive a message?"""
+    cmd = str(h.get("command") or "")
+    args = h.get("args")
+    if isinstance(args, list):
+        # exec form: spawned directly, no shell, no $HOME expansion
+        return _probe(lambda _s: ([cmd] + [str(a) for a in args], False))
+    # shell form: `sh -c`, so `#`, `&&`, `;` and `$HOME` all apply -- which is
+    # precisely why it has to be run rather than parsed
+    return _probe(lambda _s: (cmd, True))
+
+
+def _post_entries(cfg, path):
+    """(matcher, hook, path) triples out of one settings file -> (list, bad).
+
+    Every traversal is defensive. `settings.json` is hand-edited, and a shape
+    this did not expect -- a top-level list, `PostToolUse` as a dict, an entry
+    with no `matcher` -- used to raise straight out of `comms doctor` with a
+    traceback and no verdict at all.
+    """
+    out, bad = [], 0
+    if not isinstance(cfg, dict):
+        print("hook      CHECK  %s is a %s, not an object"
+              % (path, type(cfg).__name__))
+        return out, 1
+    hooks = cfg.get("hooks")
+    if hooks is None:
+        return out, 0
+    if not isinstance(hooks, dict):
+        print("hook      CHECK  hooks in %s is a %s, not an object"
+              % (path, type(hooks).__name__))
+        return out, 1
+    post = hooks.get("PostToolUse")
+    if post is None:
+        return out, 0
+    if not isinstance(post, list):
+        print("hook      CHECK  hooks.PostToolUse in %s is a %s, not a list"
+              % (path, type(post).__name__))
+        return out, 1
+    for entry in post:
+        if not isinstance(entry, dict):
+            continue
+        inner = entry.get("hooks")
+        if not isinstance(inner, list):
+            continue
+        for h in inner:
+            if isinstance(h, dict):
+                out.append((entry.get("matcher"), h, path))
+    return out, 0
+
+
+def _check_hook():
+    """Is the hook wired up, present and runnable? -> problem count."""
+    bad = 0
+    if not os.path.exists(HOOK):
+        print("hook      MISSING: %s" % HOOK)
+        print("          nothing is being archived on any channel")
+        return 1
+    if not os.access(HOOK, os.X_OK):
+        print("hook      CHECK  not executable: %s" % HOOK)
+        bad += 1
+    found = []
+    for path, trusted in _settings_files():
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path) as fh:
+                cfg = json.load(fh)
+        except Exception as e:
+            print("hook      CHECK  cannot read %s (%s)" % (path, e))
+            bad += 1
+            continue
+        got, worse = _post_entries(cfg, path)
+        found.extend((m, h, pa, trusted) for (m, h, pa) in got)
+        bad += worse
+    covering, dead, unrun = [], [], []
+    for matcher, h, path, trusted in found:
+        # http / prompt / agent / mcp_tool entries never run our script
+        if (h.get("type") or "command") != "command":
+            continue
+        if not _mentions_hook(h.get("command"), h.get("args")):
+            continue
+        if not trusted:
+            covering.append(matcher)
+            unrun.append(path)
+            continue
+        ok, why = _entry_live(h)
+        (covering.append(matcher) if ok else dead.append((path, why)))
+    for path in sorted(set(unrun)):
+        print("hook      note   %s registers the hook. It counts, but it is "
+              "NOT run: a settings file in the current repo is not ours to "
+              "execute." % path)
+    for path, why in dead:
+        print("hook      CHECK  the entry in %s names %s but does not archive:"
+              " %s" % (path, os.path.basename(HOOK), why))
+        bad += 1
+    missing = [t for t in WANT_TOOLS
+               if not any(_matcher_covers(m, t) for m in covering)]
+    if missing and not os.path.isdir(os.path.expanduser("~/.claude")):
+        print("hook      skip   no Claude Code settings here (only an agent needs the hook)")
+    elif missing:
+        print("hook      CHECK  not registered for: %s" % ", ".join(missing))
+        print("          nothing on those tools is being archived - add a "
+              "PostToolUse entry in %s pointing at %s" % (SETTINGS, HOOK))
+        bad += 1
+    else:
+        shown = ", ".join(sorted(str(m) for m in covering)) or "match-all"
+        print("hook      %s registered for %s (verified by running it)"
+              % ("ok    " if not bad else "CHECK ", shown))
+    # ALWAYS, even when no settings file could be read: "registered" and
+    # "works" are different failures and an unreadable settings file used to
+    # suppress the second check entirely.
+    return bad + _check_hook_runs() + _check_store_writable()
+
+
+def _check_store_writable():
+    """Can the REAL archive be written? -> problem count.
+
+    `_check_hook_runs` proves the pair works in a throwaway HOME, which is
+    what makes it safe -- and also means it says nothing about THIS machine's
+    archive. A store directory that is read-only, root-owned or on a full disk
+    was reported healthy: the hook swallows the write error by design, so
+    nothing else would ever mention it.
+    """
+    try:
+        C.secure_dir(C.STORE)
+        probe = os.path.join(C.STORE, ".doctor-write-probe")
+        with open(probe, "w") as fh:
+            fh.write("")
+        os.remove(probe)
+        return 0
+    except Exception as e:
+        print("hook      CHECK  the real archive is not writable: %s (%s)"
+              % (C.STORE, e))
+        print("          the hook starts, runs clean and silently records "
+              "nothing")
+        return 1
+
+
+def _check_hook_runs():
+    """Does the INSTALLED pair archive a message end to end? -> problems.
+
+    Registered is not the same as working. `comms-log.py` imports `commslib`,
+    and a pair that has drifted apart -- a new hook calling `failed()` with
+    arguments an old library does not take -- raises before it writes a thing.
+    Claude Code does not surface that, so capture just stops. Measured
+    2026-09-09: nine of nine test sends vanished with no error anywhere.
+
+    A probe that only ran `true` returned clean against a library that was
+    genuinely too old to capture anything, so this drives a real send payload
+    all the way through import, parsing, `failed()`, recovery and the write.
+    """
+    ok, why = _probe(lambda _s: ([sys.executable, HOOK], False),
+                     payloads=PROBE_CASES)
+    if ok:
+        print("hook      ok     archived a probe on all %d channels: %s"
+              % (len(PROBE_CASES), ", ".join(c[0] for c in PROBE_CASES)))
+        return 0
+    print("hook      CHECK  %s" % why)
+    print("          usually a version skew: reinstall comms-log.py and "
+          "commslib.py together, library first")
+    return 1
+
+def cmd_stats(a):
+    th = C._load(C.THREADS, {})
+    total = sum(t.get("count", 0) for t in th.values())
+    unrouted = [t for t in th.values() if not t.get("project")]
+    print("threads: %d   messages: %d   unrouted threads: %d"
+          % (len(th), total, len(unrouted)))
+    for t in sorted(th.values(), key=lambda x: -x.get("count", 0))[:15]:
+        print("  %-18s %-9s %5d  %s" % (
+            (t.get("label") or t.get("target"))[:18], t.get("channel", ""),
+            t.get("count", 0), t.get("project") or "UNROUTED"))
+
+
+def _store_rows():
+    """Raw rows from the central store — each carries `project` and `cwd`."""
+    rows = []
+    for p in sorted(glob.glob(os.path.join(C.STORE, "*.jsonl"))):
+        try:
+            with open(p, errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        pass
+        except OSError:
+            pass
+    return rows
+
+
+# Folders that are not client repos: the planning hub and Claude's own config.
+# A route's cwd landing here is noise (notes-to-self, cross-project partners),
+# never a folder to scope a client to.
+_NOT_A_REPO = (os.path.expanduser("~/.claude"),
+               *(os.path.expanduser(str(p)) for p in kitconfig.get_list("not_a_repo")))
+
+
+def cmd_here(a):
+    """Which client owns this folder, and that client's rooms per channel.
+
+    The cheap catalog: names + ids only, no message bodies. An unowned folder
+    prints nothing to read and says reads are global -- it never errors, so it
+    is safe to call at the top of any skill."""
+    cwd = os.path.abspath(os.path.expanduser(a.path)) if a.path else os.getcwd()
+    project = C.resolve_project(cwd, C._load(C.REPOS, {}))
+    rooms = C.catalog_for_project(project, C._load(C.THREADS, {}), a.channel)
+    if a.json:
+        print(json.dumps({
+            "cwd": cwd, "project": project,
+            "rooms": [{"channel": r.get("channel"), "target": r.get("target"),
+                       "label": r.get("label"), "count": r.get("count"),
+                       "last_et": r.get("last_et")} for r in rooms]},
+            ensure_ascii=False))
+        return 0
+    if not project:
+        print("no client owns this folder:\n  %s" % cwd)
+        print('reads here are GLOBAL. to scope it:\n'
+              '  comms link "%s" <project>' % cwd)
+        return 0
+    print("client: %s\n  %s" % (project, cwd))
+    if not rooms:
+        print("  (no rooms captured yet for this client)")
+        return 0
+    by_ch = {}
+    for r in rooms:
+        by_ch.setdefault(r.get("channel") or "?", []).append(r)
+    for ch in sorted(by_ch):
+        print("  %s:" % ch)
+        for r in by_ch[ch]:
+            name = (r.get("label") or r.get("target") or "?")[:30]
+            print("    %-30s  %s  (%s msgs, last %s)" % (
+                name, r.get("target"), r.get("count"), r.get("last_et") or "?"))
+    return 0
+
+
+def cmd_link(a):
+    """Map a client repo folder to a project — the data `comms here` reads."""
+    if a.suggest or a.apply:
+        links, conflicts = C.suggest_repos(_store_rows(), _NOT_A_REPO)
+        if not links and not conflicts:
+            print("no signal yet — need archived messages carrying a cwd")
+            return 0
+        print("clean links (%d):" % len(links))
+        for cwd, proj in sorted(links.items(), key=lambda x: x[1]):
+            print('  %-30s -> %s' % (proj, cwd))
+        if conflicts:
+            print("\nneeds your call (%d) — a shared or home-less folder, "
+                  "not auto-linked:" % len(conflicts))
+            for c in sorted(conflicts, key=lambda x: x["project"]):
+                print('  %-24s busiest folder is owned by %s\n'
+                      '      %s' % (c["project"], c["owner"], c["cwd"]))
+        if a.apply:
+            repos = C.load_strict(C.REPOS, {}) or {}
+            repos.update(links)
+            C._save(C.REPOS, repos)
+            print("\nwrote %d links -> %s" % (len(links), C.REPOS))
+        else:
+            print("\nnothing written. re-run with --apply to save the clean "
+                  "links, or link one by hand:\n"
+                  '  comms link "<abs repo folder>" <project>')
+        return 0
+    if not a.path or not a.project:
+        print('usage: comms link "<abs repo folder>" <project>\n'
+              "       comms link --suggest           propose from history\n"
+              "       comms link --suggest --apply   write the clean ones")
+        return 1
+    path = os.path.abspath(os.path.expanduser(a.path))
+    repos = C.load_strict(C.REPOS, {}) or {}
+    repos[path] = a.project
+    C._save(C.REPOS, repos)
+    print('linked "%s" -> %s' % (path, a.project))
+    return 0
+
+
+# ---- comms unread: read-only, scoped to the current client, all channels ----
+
+def _run_reader(cmd, timeout=45):
+    """Run a channel reader; return (stdout, short_err). Never raises."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.stdout, ("" if p.returncode == 0
+                          else (p.stderr or "exit %d" % p.returncode))
+    except Exception as e:  # noqa: BLE001 - a reader must never crash `unread`
+        return "", str(e)
+
+
+def _wa_lines(target, n):
+    out, err = _run_reader(
+        ["python3",
+         C.channel_cli("whatsapp"),
+         "history", str(target), "-n", str(n), "--no-transcribe"],
+        timeout=90)  # the bridge does a full Matrix /sync; ~55s cold
+    if not out:
+        tail = err.strip().splitlines()[-1][:80] if err.strip() else "no output"
+        return ["(whatsapp unavailable: %s)" % tail]
+    lines = [ln.strip() for ln in out.splitlines()
+             if ln.strip() and not ln.startswith("History for")]
+    return lines or ["(nothing recent)"]
+
+
+def _im_lines(target, n):
+    out, _ = _run_reader(
+        [C.channel_cli("imessage"), "history",
+         "--chat-id", str(target), "--limit", str(n)])
+    if not out:
+        return ["(imessage unavailable)"]
+    try:
+        payload = json.loads(out)
+    except Exception:
+        return ["(imessage: unreadable output)"]
+    return C.format_imessage(payload, n) or ["(nothing recent)"]
+
+
+def _slack_messages(target, n):
+    """(messages, notes) for one Slack channel or DM, read LIVE with thread replies.
+
+    The bridge buffer (`history`) holds top-level messages only, and on 2026-10-26 it
+    held none for a client's DMs or alert channel, so a buffer-only read showed 3
+    messages where Slack had replies and DMs waiting. `threads --json` reads Slack
+    itself (about 4 s over ssh). When that fails, fall back to the buffer and SAY so:
+    a feed that silently lost its replies would look complete."""
+    script = C.channel_cli("slack")
+    # norm() lowercased the channel id; the bridge needs the uppercase Slack id.
+    tgt = str(target).upper()
+    out, err = _run_reader(["python3", script, "threads", tgt, "--json",
+                            "-n", str(n)], timeout=90)
+    live = C.slack_feed_messages(out)
+    if live is not None:
+        return live, []
+    why = (err.strip().splitlines() or ["no feed"])[-1][:80]
+    out, err = _run_reader(["python3", script, "history", tgt, "-n", str(n)])
+    note = "(slack %s: live read failed (%s); buffer only, no thread replies)" % (tgt, why)
+    if not out.strip():
+        if err.strip():
+            return [], ["(slack unavailable: %s)" % err.strip().splitlines()[-1][:80]]
+        return [], [note]
+    msgs = []
+    for raw in out.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            msgs.append(json.loads(raw))
+        except Exception:
+            pass
+    return msgs, [note]
+
+
+def _slack_lines(target, n):
+    msgs, notes = _slack_messages(target, n)
+    return (C.format_slack(msgs, n) + notes) or ["(no recent slack messages)"]
+
+
+def _gmail_read_one(mid, account=None):
+    """Read one message id for its From/Subject/Date -> one '[et] from - subj'
+    line, or None if it can't be read. Date is converted to the Mac's local
+    zone (never the sender's own offset)."""
+    out, _ = _run_reader(
+        _gws(account, ["gmail", "+read", "--id", str(mid), "--headers",
+                       "--format", "json"]))
+    try:
+        d = json.loads(out)
+    except Exception:
+        return None
+    frm = d.get("from") or d.get("From")
+    if isinstance(frm, dict):
+        frm = frm.get("email") or frm.get("name")
+    subj = d.get("subject") or d.get("Subject") or "(no subject)"
+    when = C._rfc2822_to_et(d.get("date") or d.get("Date") or "")
+    return "[%s] %s - %s" % (when or "?", frm or "?", subj)
+
+
+def _gmail_search_lines(addresses, days, n, account=None):
+    """One real 'new mail from this client' search across ALL their addresses,
+    newest first -- NOT a re-read of known threads, so a brand-new sender still
+    shows. `gws ... users messages list` returns ids only; each id is then read
+    for from/subject/date. days=0 ('all') searches a generous 90-day window
+    rather than the whole mailbox."""
+    if not addresses:
+        return ["(no saved email addresses for this client)"]
+    window = days if (days and days > 0) else 90
+    q = "from:(%s) newer_than:%dd" % (" OR ".join(addresses), window)
+    params = json.dumps({"userId": "me", "q": q, "maxResults": n})
+    out, err = _run_reader(
+        _gws(account, ["gmail", "users", "messages", "list",
+                       "--params", params, "--format", "json"]))
+    if not out.strip():
+        if err.strip():
+            return ["(gmail unavailable: %s)" % err.strip().splitlines()[-1][:80]]
+        return ["(no new mail in the last %dd)" % window]
+    try:
+        ids = [m.get("id") for m in (json.loads(out).get("messages") or [])
+               if m.get("id")]
+    except Exception:
+        return ["(gmail: unreadable search output)"]
+    if not ids:
+        return ["(no new mail in the last %dd)" % window]
+    # Each +read is an independent API call -> fan out; ex.map keeps order.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        lines = [ln for ln in ex.map(lambda m: _gmail_read_one(m, account), ids[:n]) if ln]
+    return lines or ["(no new mail in the last %dd)" % window]
+
+
+def _gmail_accounts():
+    """Emails of the ADDED Gmail accounts; [] when there are none (the common case)."""
+    try:
+        return GA.list_added() if GA else []
+    except Exception:  # noqa: BLE001 - a broken accounts folder must not stop the main scan
+        return []
+
+
+def _per_account(fn, accounts):
+    """fn(account) for the main login (None) then each added account, side by side.
+    -> [(account or None, result)]. One account raising returns that exception as its result."""
+    def one(acct):
+        try:
+            return fn(acct)
+        except Exception as e:  # noqa: BLE001 - one account must never sink the others
+            return e
+    todo = [None] + list(accounts)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(todo)) as ex:
+        return list(zip(todo, ex.map(one, todo)))
+
+
+def _gmail_dead(line):
+    """True for the sentinel the readers print when Gmail itself did not answer."""
+    return line.startswith("(gmail unavailable") or line.startswith("(gmail: unreadable")
+
+
+def _gmail_search_lines_all(addresses, days, n):
+    """The Gmail search over EVERY connected account. With no added account this is exactly the
+    old single search (same gws call, same lines). With some, each line names its account, and an
+    account that does not answer becomes ONE warning line while the others still show."""
+    accounts = _gmail_accounts()
+    if not accounts:
+        return _gmail_search_lines(addresses, days, n)
+    lines, warns, main_lines = [], [], []
+    def search(a):
+        why = GA.preflight(a) if a else None
+        if why:
+            return ["(gmail unavailable: %s)" % why]
+        return _gmail_search_lines(addresses, days, n, a)
+
+    for acct, res in _per_account(search, accounts):
+        label = acct or GA.MAIN_LABEL
+        if isinstance(res, Exception):
+            res = ["(gmail unavailable: %s)" % str(res)[:80]]
+        real = [ln for ln in res if not ln.startswith("(")]
+        lines += ["%s (account: %s)" % (ln, label) for ln in real]
+        if acct is None:
+            main_lines = res
+            if not real and any(_gmail_dead(ln) for ln in res):
+                warns.append(res[0])         # the main login failed: say so, in its own words
+        elif not real and any(_gmail_dead(ln) for ln in res):
+            warns.append(GA.warning(acct, res[0].split(": ", 1)[-1].rstrip(")")))
+    if not lines:
+        # nothing anywhere: the main account's own words ("no new mail", or why it failed)
+        return (main_lines or ["(no new mail)"]) + warns
+    return lines + warns
+
+
+def _gmail_search_records_all(addresses, days, n):
+    """_gmail_search_records over every connected account: (records, notes). Records carry
+    `account`; a dead added account is ONE note."""
+    accounts = _gmail_accounts()
+    if not accounts:
+        return _gmail_search_records(addresses, days, n)
+    recs, notes = [], []
+    def search(a):
+        why = GA.preflight(a) if a else None
+        if why:
+            return [], ["(gmail unavailable: %s)" % why]
+        return _gmail_search_records(addresses, days, n, a)
+
+    for acct, res in _per_account(search, accounts):
+        if isinstance(res, Exception):
+            res = ([], ["(gmail unavailable: %s)" % str(res)[:80]])
+        r, ns = res
+        for x in r:
+            x["account"] = acct or GA.MAIN_LABEL
+        recs += r
+        if acct is None:
+            notes += ns
+        elif not r and any(_gmail_dead(nt) for nt in ns):
+            notes.append(GA.warning(acct, ns[0].split(": ", 1)[-1].rstrip(")")))
+    return recs, notes
+
+
+# Gmail is deliberately absent: it is handled as ONE cross-address search in
+# cmd_unread, not as one adapter call per known thread.
+_UNREAD_ADAPTERS = {"whatsapp": _wa_lines, "imessage": _im_lines,
+                    "slack": _slack_lines}
+
+
+# ---- structured (record) readers for the --merged feed --------------------
+# These MIRROR the grouped readers above but return (records, notes): a list of
+# merge-feed records carrying a real epoch per message, plus notes for anything
+# that is NOT a message (a channel that failed to load, an empty search). The
+# grouped readers are deliberately left untouched -- they are the shipped,
+# live-tested path -- so the merged feed re-reads rather than reshapes them.
+
+def _wa_records(target, n):
+    """(records, notes). WhatsApp has no structured mode, so the same printed
+    lines the grouped view shows are parsed back to epoch-bearing records; any
+    error / empty-state sentinel comes back as a note."""
+    return C.parse_whatsapp_records(_wa_lines(target, n))
+
+
+def _im_records(target, n):
+    """(records, notes) for one iMessage chat."""
+    out, _ = _run_reader(
+        [C.channel_cli("imessage"), "history",
+         "--chat-id", str(target), "--limit", str(n)])
+    if not out:
+        return [], ["(imessage unavailable)"]
+    try:
+        payload = json.loads(out)
+    except Exception:
+        return [], ["(imessage: unreadable output)"]
+    return C.imessage_records(payload, n), []
+
+
+def _slack_records(target, n):
+    """(records, notes) for one Slack channel."""
+    msgs, notes = _slack_messages(target, n)
+    return C.slack_records(msgs, n), notes
+
+
+def _gmail_read_record(mid, account=None):
+    """One message id -> a gmail merge-feed record, or None if unreadable. Mirrors
+    _gmail_read_one but keeps the epoch instead of pre-formatting a line."""
+    out, _ = _run_reader(
+        _gws(account, ["gmail", "+read", "--id", str(mid), "--headers",
+                       "--format", "json"]))
+    try:
+        d = json.loads(out)
+    except Exception:
+        return None
+    frm = d.get("from") or d.get("From")
+    if isinstance(frm, dict):
+        frm = frm.get("email") or frm.get("name")
+    subj = d.get("subject") or d.get("Subject") or "(no subject)"
+    return C.gmail_record(frm, subj, d.get("date") or d.get("Date") or "",
+                          account=account)
+
+
+def _gmail_search_records(addresses, days, n, account=None):
+    """(records, notes): the same cross-address 'new mail from this client'
+    search as _gmail_search_lines, but returning epoch-bearing records."""
+    if not addresses:
+        return [], ["(no saved email addresses for this client)"]
+    window = days if (days and days > 0) else 90
+    q = "from:(%s) newer_than:%dd" % (" OR ".join(addresses), window)
+    params = json.dumps({"userId": "me", "q": q, "maxResults": n})
+    out, err = _run_reader(
+        _gws(account, ["gmail", "users", "messages", "list",
+                       "--params", params, "--format", "json"]))
+    if not out.strip():
+        if err.strip():
+            return [], ["(gmail unavailable: %s)"
+                        % err.strip().splitlines()[-1][:80]]
+        return [], []
+    try:
+        ids = [m.get("id") for m in (json.loads(out).get("messages") or [])
+               if m.get("id")]
+    except Exception:
+        return [], ["(gmail: unreadable search output)"]
+    if not ids:
+        return [], []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        recs = [r for r in ex.map(lambda m: _gmail_read_record(m, account), ids[:n]) if r]
+    return recs, []
+
+
+_MERGED_ADAPTERS = {"whatsapp": _wa_records, "imessage": _im_records,
+                    "slack": _slack_records}
+
+
+def _trim(line, full):
+    line = line.rstrip()
+    return line if (full or len(line) <= 200) else line[:197] + "..."
+
+
+def cmd_unread(a):
+    """New messages for THIS client only, across every channel. Read-only.
+
+    Resolves the client from the folder, then reads ONLY that client's rooms --
+    never the whole account. An unowned folder refuses rather than sweeping
+    everything."""
+    cwd = os.path.abspath(os.path.expanduser(a.path)) if a.path else os.getcwd()
+    project = C.resolve_project(cwd, C._load(C.REPOS, {}))
+    if not project:
+        print("no client owns this folder. cd into a client repo, or name a "
+              "chat with the channel's own skill / `comms find`.")
+        return 1
+    rooms = C.catalog_for_project(project, C._load(C.THREADS, {}), a.channel)
+    rooms = C.active_rooms(rooms, a.days)
+
+    # Gmail is a real "new from this client" SEARCH across the client's saved
+    # addresses -- not a re-read of known threads -- so it surfaces brand-new
+    # senders. It fires whenever the client has addresses and the channel filter
+    # allows gmail, even if no known gmail thread is recent. Every other channel
+    # reads its known rooms as before.
+    routes = C._load(C.ROUTES, {})
+    emails = C.project_emails(project, routes)
+    do_gmail = bool(emails) and a.channel in (None, "gmail")
+    # Each chat once, with the id its reader can open (room ids keep case).
+    targets = C.reader_rooms(
+        [r for r in rooms if r.get("channel") != "gmail"], routes=routes)
+    other_rooms = [r for r, _t in targets]
+    reader_id = {id(r): t for r, t in targets}
+
+    if not other_rooms and not do_gmail:
+        print("client: %s -- no chats active in the last %d days (try --days 0)."
+              % (project, a.days))
+        return 0
+    parts = []
+    if other_rooms:
+        parts.append("%d room%s" % (len(other_rooms),
+                                    "" if len(other_rooms) == 1 else "s"))
+    if do_gmail:
+        parts.append("gmail search")
+    print("client: %s   (last %d days, %s)"
+          % (project, a.days, ", ".join(parts)))
+
+    if a.merged:
+        # ONE newest-first list across every channel. Each reader returns
+        # (records, notes); we merge the records and surface the notes, so a
+        # channel that failed to load is reported, never silently dropped from a
+        # feed that would otherwise look complete.
+        def mfetch(r):
+            ch, tgt = r.get("channel"), r.get("target")
+            name = r.get("label") or tgt
+            adapter = _MERGED_ADAPTERS.get(ch)
+            if not adapter:
+                return ([], ["(%s: read with the %s skill; target %s)"
+                             % (ch, ch, tgt)])
+            try:
+                return adapter(reader_id[id(r)], a.last)
+            except Exception as e:  # noqa: BLE001 - one bad room can't sink the feed
+                return ([], ["(%s %s error: %s)" % (ch, name, str(e)[:80])])
+
+        # iMessage first, on its own: beside many Slack reads it timed out (run_phased).
+        tasks = [(r.get("channel"), (lambda r=r: mfetch(r))) for r in other_rooms]
+        if do_gmail:
+            tasks.append(("gmail", lambda: _gmail_search_records_all(emails, a.days, a.last)))
+        results = C.run_phased(tasks, first={"imessage"})
+
+        records, notes = [], []
+        for recs, ns in results:
+            records.extend(recs)
+            notes.extend(ns)
+        # No feed-wide cap: --last is per room, so the merged list holds exactly
+        # the same messages the grouped view would, just interleaved by time.
+        feed = C.merge_feed(records)
+        if feed:
+            for ln in feed:
+                print("  " + _trim(ln, a.full))
+        else:
+            print("  (no messages in this window)")
+        notes = [nt for nt in notes if nt and nt.strip()]
+        if notes:
+            print("\nnotes:")
+            for nt in notes:
+                print("  " + nt)
+        return 0
+
+    def fetch(r):
+        ch, tgt = r.get("channel"), r.get("target")
+        name = r.get("label") or tgt
+        adapter = _UNREAD_ADAPTERS.get(ch)
+        if not adapter:
+            return (ch, name, tgt, None)
+        try:
+            return (ch, name, tgt, adapter(reader_id[id(r)], a.last))
+        except Exception as e:  # noqa: BLE001 - one bad room must not sink the rest
+            return (ch, name, tgt, ["(error: %s)" % str(e)[:80]])
+
+    def fetch_gmail():
+        try:
+            return ("gmail", project, "search",
+                    _gmail_search_lines_all(emails, a.days, a.last))
+        except Exception as e:  # noqa: BLE001 - never sink the other channels
+            return ("gmail", project, "search", ["(error: %s)" % str(e)[:80]])
+
+    # Readers are slow (WhatsApp ~55s) and independent -> run concurrently so
+    # total time is the slowest single task, not the sum. Order is preserved.
+    # iMessage first, on its own: beside many Slack reads it timed out (run_phased).
+    tasks = [(r.get("channel"), (lambda r=r: fetch(r))) for r in other_rooms]
+    if do_gmail:
+        tasks.append(("gmail", fetch_gmail))
+    results = C.run_phased(tasks, first={"imessage"})
+
+    for ch, name, tgt, lines in results:
+        print("\n%s . %s" % (ch, name))
+        if lines is None:
+            print("  (%s: read with the %s skill; target %s)" % (ch, ch, tgt))
+            continue
+        for ln in lines:
+            print("  " + _trim(ln, a.full))
+    return 0
+
+
+p = argparse.ArgumentParser(prog="comms", description=__doc__)
+sub = p.add_subparsers(dest="cmd")
+
+
+def common(sp):
+    sp.add_argument("--last", type=int, default=30)
+    sp.add_argument("--days", type=int, default=None)
+    sp.add_argument("--full", action="store_true")
+    sp.add_argument("--live", action="store_true",
+                    help="only what Claude Code captured; skip the exported "
+                         "KB history in <project>/history/")
+    return sp
+
+
+f = common(sub.add_parser("find", help="search all logged messages"))
+f.add_argument("query")
+f.add_argument("--channel")
+f.add_argument("--project")
+f.set_defaults(fn=cmd_find)
+
+t = common(sub.add_parser("thread", help="one conversation"))
+t.add_argument("target")
+t.set_defaults(fn=cmd_thread)
+
+r = common(sub.add_parser("recent", help="latest across all channels"))
+r.set_defaults(fn=cmd_recent)
+
+ro = sub.add_parser("route", help="assign a contact to a project")
+ro.add_argument("target")
+ro.add_argument("project")
+ro.add_argument("--path", help="absolute repo path to mirror into")
+ro.add_argument("--label")
+ro.add_argument("--alias", action="append",
+                help="another identifier for the SAME person (repeatable) - "
+                     "their id on a second channel. Applied retroactively.")
+ro.set_defaults(fn=cmd_route)
+
+un = sub.add_parser("unroute", help="remove a contact's route (the inbox's People and channels)")
+un.add_argument("target")
+un.add_argument("--from", dest="from_project",
+                help="only if it is routed to this project now")
+un.set_defaults(fn=cmd_unroute)
+
+def _add_contact_parser():
+    """`comms contact` lives in contactbook.py. A bad import there must never stop the archive
+    commands, so it only loses this one subcommand."""
+    try:
+        import contactbook
+    except BaseException as error:
+        sys.stderr.write("comms: contact is unavailable: %s\n" % error)
+        return
+    contactbook.add_parser(sub, cmd_route)
+
+
+_add_contact_parser()
+
+sub.add_parser("routes", help="list contact -> project map").set_defaults(
+    fn=cmd_routes)
+sub.add_parser("unrouted", help="contacts with no project yet").set_defaults(
+    fn=cmd_unrouted)
+def cmd_project(a):
+    """Every message for one project, all channels, chronological."""
+    out = [r for r in all_rows(a) if r.get("project") == a.project]
+    show(tail(out, a.last), None, a.full)
+
+
+pj = common(sub.add_parser("project", help="everything for one project, "
+                           "across every channel"))
+pj.add_argument("project")
+pj.set_defaults(fn=cmd_project)
+
+he = sub.add_parser("here", help="which client owns this folder, and its rooms")
+he.add_argument("--path", help="folder to resolve (default: current dir)")
+he.add_argument("--channel",
+                help="only this channel (whatsapp|imessage|slack|gmail|upwork)")
+he.add_argument("--json", action="store_true", help="machine-readable output")
+he.set_defaults(fn=cmd_here)
+
+ln = sub.add_parser("link",
+                    help="map a client repo folder to a project (for `here`)")
+ln.add_argument("path", nargs="?", help="absolute repo folder")
+ln.add_argument("project", nargs="?", help="project name")
+ln.add_argument("--suggest", action="store_true",
+                help="propose links from where messages were sent (read-only)")
+ln.add_argument("--apply", action="store_true",
+                help="with --suggest, write every clean link")
+ln.set_defaults(fn=cmd_link)
+
+ur = sub.add_parser("unread",
+                    help="new messages for THIS client only, across channels")
+ur.add_argument("--path", help="folder to resolve (default: current dir)")
+ur.add_argument("--channel",
+                help="only this channel (whatsapp|imessage|slack|gmail)")
+ur.add_argument("--last", type=int, default=6,
+                help="messages per room (default 6)")
+ur.add_argument("--days", type=int, default=14,
+                help="only rooms active within N days (0 = all)")
+ur.add_argument("--full", action="store_true", help="do not trim long lines")
+ur.add_argument("--merged", action="store_true",
+                help="one newest-first list across ALL channels, interleaved, "
+                     "instead of grouping by room")
+ur.set_defaults(fn=cmd_unread)
+
+sub.add_parser("stats", help="counts per thread").set_defaults(fn=cmd_stats)
+rx = sub.add_parser("reindex", help="rebuild threads.json + INDEX.md from the "
+                    "rows (safe any time)")
+rx.add_argument("--repair", action="store_true",
+                help="fill text an older parser missed and re-key gmail rows "
+                     "filed under a message id (local only, no network)")
+rx.add_argument("--prune", action="store_true",
+                help="also DELETE rows the current rules reject; default only "
+                     "counts them")
+rx.set_defaults(fn=cmd_reindex)
+bf = sub.add_parser("backfill", help="fetch text for sends whose words were "
+                    "never on the command line (Gmail/Slack; read-only)")
+bf.add_argument("--channel", choices=["gmail", "slack"],
+                help="only this channel (default: both)")
+bf.add_argument("--limit", type=int, default=25,
+                help="how many sends to fetch, newest first (0 = no limit)")
+bf.add_argument("--oldest-first", action="store_true",
+                help="work through the oldest sends instead of the newest")
+bf.add_argument("--apply", action="store_true",
+                help="write the recovered text; default is a plan only")
+bf.add_argument("--retry-failed", action="store_true",
+                help="ask again about sends a previous run marked "
+                     "unrecoverable")
+bf.add_argument("--timeout", type=int, default=45,
+                help="seconds per fetch (default 45; --limit 25 is the "
+                     "worst-case multiplier)")
+bf.set_defaults(fn=cmd_backfill)
+sub.add_parser("doctor", help="check the verb map against each CLI's --help; "
+               "run after any comms CLI update").set_defaults(fn=cmd_doctor)
+
+def cmd_gmail_account(args):
+    """add | list | rm for the ADDED Gmail accounts (gmail_accounts.py). The main login is
+    never changed here."""
+    if GA is None:
+        print("gmail_accounts.py could not be imported: %s" %
+              os.path.join(CORE, "gmail_accounts.py"), file=sys.stderr)
+        return 2
+    try:
+        if args.action == "list":
+            return GA.cmd_list()
+        if not args.email:
+            print("comms gmail-account %s needs an EMAIL" % args.action, file=sys.stderr)
+            return 2
+        if args.action == "add":
+            return GA.cmd_add(args.email)
+        return GA.cmd_rm(args.email, args.yes)
+    except GA.AccountError as e:
+        print("comms gmail-account: %s" % e, file=sys.stderr)
+        return 2
+
+
+ga = sub.add_parser("gmail-account", help="connect more Gmail accounts: add EMAIL | list | rm EMAIL --yes "
+                    "(the main login is never touched)")
+ga.add_argument("action", choices=["add", "list", "rm"])
+ga.add_argument("email", nargs="?")
+ga.add_argument("--yes", action="store_true", help="rm: really delete that account's folder")
+ga.set_defaults(fn=cmd_gmail_account)
+
+
+def cmd_selftest(_args):
+    import selftest
+    return selftest.main()
+
+
+sub.add_parser("selftest", help="offline simulated readers and planted-bad-message checks; no sends"
+               ).set_defaults(fn=cmd_selftest)
+
+a = p.parse_args()
+if not getattr(a, "fn", None):
+    p.print_help()
+    sys.exit(0)
+sys.exit(a.fn(a) or 0)

@@ -1,0 +1,7 @@
+{
+  "instantly": {
+    "workspaces": {
+      "my-workspace": ["your-secret-tool", "INSTANTLY_KEY_MY_WORKSPACE"]
+    }
+  }
+}

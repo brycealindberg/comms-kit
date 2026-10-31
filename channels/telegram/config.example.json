@@ -1,0 +1,7 @@
+{
+  "telegram": {
+    "api_id_command": ["your-secret-tool", "TELEGRAM_API_ID_EXAMPLE"],
+    "api_hash_command": ["your-secret-tool", "TELEGRAM_API_HASH_EXAMPLE"],
+    "session_path": "~/.config/comms-kit/telegram.session"
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "name": "slack",
+  "entry": "slack_bridge.py",
+  "kind": "python-cli",
+  "verbs": {
+    "channels": {"direction": "read"},
+    "contacts": {"direction": "read"},
+    "history": {"direction": "read"},
+    "threads": {"direction": "read"},
+    "files": {"direction": "read"},
+    "download": {"direction": "read"},
+    "transcribe": {"direction": "read"},
+    "transcribe-channel": {"direction": "read"},
+    "find": {"direction": "read"},
+    "mentions": {"direction": "read"},
+    "open-dm": {"direction": "read"},
+    "channel-members": {"direction": "read"},
+    "send": {"direction": "send", "dry_run_unless_yes": true},
+    "upload": {"direction": "send", "dry_run_unless_yes": true},
+    "react": {"direction": "send", "dry_run_unless_yes": true},
+    "edit": {"direction": "send", "dry_run_unless_yes": true},
+    "delete": {"direction": "send", "dry_run_unless_yes": true},
+    "channel-create": {"direction": "send", "dry_run_unless_yes": true},
+    "channel-invite": {"direction": "send", "dry_run_unless_yes": true},
+    "channel-remove": {"direction": "send", "dry_run_unless_yes": true},
+    "channel-rename": {"direction": "send", "dry_run_unless_yes": true},
+    "channel-archive": {"direction": "send", "dry_run_unless_yes": true},
+    "channel-leave": {"direction": "send", "dry_run_unless_yes": true}
+  },
+  "ignored": ["status", "workspaces", "sync", "pair"],
+  "blocked": {
+    "mark-read": "A recorded decision to stay off. The CLI and the server-side allow-list hold no .mark call, and a test pins that.",
+    "block": "Slack has no API for blocking a user with the session token the bridge holds, so there is nothing to call."
+  },
+  "config_keys": [
+    "slack.bridge_url",
+    "slack.ssh_host",
+    "slack.vps_bridge_dir",
+    "slack.repo_root",
+    "slack.bridge_dir",
+    "slack.owner_user_id",
+    "slack.e2e_workspace",
+    "slack.self_dm",
+    "slack.e2e_react_ts"
+  ],
+  "requires": ["python3", "ssh", "node"]
+}

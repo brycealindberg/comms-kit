@@ -1,0 +1,59 @@
+{
+  "commands": [
+    {
+      "name": "contact add",
+      "argv": [
+        "core/bin/comms",
+        "contact",
+        "add",
+        "Alex Doe",
+        "--phone",
+        "+1 206 555 0100",
+        "--email",
+        "alex@example.com",
+        "--no-apple"
+      ],
+      "expect_exit": 0,
+      "timeout": 120
+    },
+    {
+      "name": "contact list",
+      "argv": [
+        "core/bin/comms",
+        "contact",
+        "list"
+      ],
+      "expect_exit": 0,
+      "timeout": 120
+    },
+    {
+      "name": "route",
+      "argv": [
+        "core/bin/comms",
+        "route",
+        "+12065550100",
+        "demo"
+      ],
+      "expect_exit": 0,
+      "timeout": 120
+    },
+    {
+      "name": "reindex",
+      "argv": [
+        "core/bin/comms",
+        "reindex"
+      ],
+      "expect_exit": 0,
+      "timeout": 120
+    },
+    {
+      "name": "recent",
+      "argv": [
+        "core/bin/comms",
+        "recent"
+      ],
+      "expect_exit": 0,
+      "timeout": 120
+    }
+  ]
+}

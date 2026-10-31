@@ -1,0 +1,16 @@
+{
+  "name": "instantly",
+  "entry": "instantly.py",
+  "kind": "python-cli",
+  "verbs": {
+    "unread": {"direction": "read"},
+    "thread": {"direction": "read"},
+    "find": {"direction": "read"},
+    "reply": {"direction": "send", "dry_run_unless_yes": true},
+    "mark-read": {"direction": "none", "dry_run_unless_yes": true}
+  },
+  "ignored": ["workspaces"],
+  "blocked": {},
+  "config_keys": ["instantly.workspaces"],
+  "requires": ["python3"]
+}

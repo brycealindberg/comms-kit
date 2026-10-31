@@ -1,0 +1,7 @@
+{
+  "imessage": {
+    "binary_path": "~/.local/share/comms-kit/imessage/vendor/imsg/v0.14.1/imsg",
+    "state_dir": "~/.local/share/comms-kit/imessage/state",
+    "draft_checker": "~/comms-kit/channels/whatsapp/draft_check.py"
+  }
+}

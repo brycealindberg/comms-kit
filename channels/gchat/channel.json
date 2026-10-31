@@ -1,0 +1,17 @@
+{
+  "name": "gchat",
+  "entry": "gchat.py",
+  "kind": "python-cli",
+  "verbs": {
+    "spaces": {"direction": "read"},
+    "history": {"direction": "read"},
+    "find": {"direction": "read"},
+    "send": {"direction": "send", "dry_run_unless_yes": true},
+    "reply": {"direction": "send", "dry_run_unless_yes": true},
+    "mark-read": {"direction": "none", "dry_run_unless_yes": true}
+  },
+  "ignored": [],
+  "blocked": {},
+  "config_keys": ["gchat.gws_account"],
+  "requires": ["python3", "gws (Google Workspace CLI, 0.22.5 was read)"]
+}
