@@ -6,6 +6,10 @@ comms-kit handles your private messages and the keys to your accounts. It runs o
 
 Open a private security advisory on this repo's GitHub page. Do not put a real token, phone number or message in a public issue.
 
+## Network checks
+
+The Slack tool checks the bridge's TLS certificate on every call. If your bridge uses a certificate your machine does not trust, set `SLACK_BRIDGE_INSECURE_TLS=1` only on a network you control: with it set, someone on your network can read your API key.
+
 ## What the kit stores
 
 | What | Where | Note |

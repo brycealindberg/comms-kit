@@ -648,6 +648,55 @@ class Find(unittest.TestCase):
         self.assertIn("No messages", out)
 
 
+class LongMessages(unittest.TestCase):
+    """The bridge keeps a very long message's whole text in formatted_body and a short copy
+    ending in [...] in body. A verb that reads only body misses everything after the cut:
+    a money word (so delete's lock stays open), a search word, the text of a preview."""
+
+    def cut(self, eid, sender, head, tail, ts=NOW_MS - 1000):
+        return msg(eid, ts, sender=sender, body=head + "[...]", extra={
+            "format": "org.matrix.custom.html", "formatted_body": f"<p>{head}</p><p>{tail}</p>"})
+
+    def test_delete_money_lock_sees_past_the_cut(self):
+        hs = FakeHS(timeline(self.cut("$long", TOOL, "Project notes", "The total is $4,000 " * 5)))
+        out, code = run(W.cmd_delete, hs, ns(event="$long", yes=True))
+        self.assertEqual(code, 6, out)
+        self.assertEqual(hs.writes(), [])
+
+    def test_chat_search_finds_a_word_past_the_cut(self):
+        hs = FakeHS([self.cut("$long", THEM, "Project notes", "podcast sponsorship " * 5)])
+        out, _ = run(W.cmd_find, hs, argparse.Namespace(text="sponsorship", chat="Alex Doe", number=10),
+                     extra_patches=[mock.patch.object(W, "_room_name", return_value="Alex Doe")])
+        self.assertIn("$long", out)
+
+    def test_search_row_and_edit_row_hold_the_whole_text(self):
+        whole = self.cut("$long", THEM, "Project notes", "tailword " * 5)
+        self.assertIn("tailword", W._find_row(whole)["text"])
+        new = {"msgtype": "m.text", "body": "Revised[...]", "formatted_body": "<p>Revised</p><p>" + "tailword " * 5 + "</p>"}
+        edit = msg("$e", NOW_MS, sender=THEM, body="* Revised[...]", extra={
+            "m.new_content": new, "m.relates_to": {"rel_type": "m.replace", "event_id": "$long"}}) | {"room_id": ROOM}
+        hs = FakeHS()
+        hs.search_results = [{"result": edit}]
+        out, _ = run(W.cmd_find, hs, argparse.Namespace(text="Revised", chat=None, number=10),
+                     extra_patches=[mock.patch.object(W, "_room_name", return_value="Alex Doe")])
+        self.assertIn("tailword", out)
+        self.assertNotIn("Revised[...]", out)
+
+    def test_reply_and_mark_read_previews_do_not_show_the_cut(self):
+        hs = FakeHS(timeline(self.cut("$long", THEM, "Brief", "more text " * 5, ts=NOW_MS)))
+        out, _ = run(W.cmd_reply, hs, ns(event="$long"))
+        self.assertIn("more text", out)
+        self.assertNotIn("[...]", out)      # the "newest message here" line reads it too
+        out, _ = run(W.cmd_mark_read, FakeHS(timeline(self.cut("$long", THEM, "Brief", "more text " * 5, ts=NOW_MS))),
+                     ns(event="$long"))
+        self.assertIn("more text", out)
+
+    def test_a_normal_message_with_a_mention_still_reads_body_in_search(self):
+        pill = msg("$p", NOW_MS - 100, sender=THEM, body="hi @Sam the invoice", extra={
+            "formatted_body": 'hi <a href="https://matrix.to/#/@wa_1:x">@Sam</a> the invoice and html ' * 3})
+        self.assertEqual(W._find_row(pill)["text"], "hi @Sam the invoice")
+
+
 def _use_config(testcase, data):
     """Point the kit config at a temp file holding `data` for one test."""
     fd, path = tempfile.mkstemp(suffix=".json")

@@ -33,6 +33,12 @@ describe('TokenStore', () => {
     assert.strictEqual(fs.statSync(CONFIG_PATH).mode & 0o777, 0o600);
   });
 
+  it('refuses a stored value whose auth tag was shortened', () => {
+    const [iv, tag, body] = store._encrypt('xoxc-f0023').split(':');
+    assert.strictEqual(store._decrypt(`${iv}:${tag}:${body}`), 'xoxc-f0023');
+    assert.throws(() => store._decrypt(`${iv}:${tag.slice(0, 8)}:${body}`));
+  });
+
   it('should save and load workspace tokens', () => {
     store.setWorkspace('T0123', {
       name: 'testworkspace',

@@ -87,6 +87,7 @@ import uuid
 import hashlib
 import html
 import re
+from html.parser import HTMLParser
 import shutil
 import mimetypes
 import tempfile
@@ -1222,6 +1223,70 @@ def _ext_for_mimetype(mimetype, fallback=""):
         if ext:
             return ext
     return fallback
+
+
+_BLOCK_TAGS = {"p", "div", "br", "li", "ul", "ol", "tr", "h1", "h2", "h3", "h4", "h5", "h6",
+               "blockquote", "pre", "table", "hr"}
+
+
+class _HtmlText(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.lists = []     # one per open list: the next number for <ol>, None for <ul>
+
+    def handle_starttag(self, tag, attrs):
+        if tag in _BLOCK_TAGS:
+            self.parts.append("\n")
+        if tag == "ol":
+            start = dict(attrs).get("start") or ""
+            self.lists.append(int(start) if start.isdigit() and len(start) < 10 else 1)
+        elif tag == "ul":
+            self.lists.append(None)
+        elif tag == "li":
+            indent = "  " * max(len(self.lists) - 1, 0)
+            number = self.lists[-1] if self.lists else None
+            if number is None:
+                self.parts.append(indent + "- ")
+            else:
+                self.parts.append(f"{indent}{number}. ")
+                self.lists[-1] = number + 1
+
+    def handle_startendtag(self, tag, attrs):
+        if tag in _BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in _BLOCK_TAGS and tag != "br":
+            self.parts.append("\n")
+        if tag in ("ol", "ul") and self.lists:
+            self.lists.pop()
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+
+def _html_to_text(html):
+    p = _HtmlText()
+    p.feed(html)
+    p.close()
+    text = "".join(p.parts)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _message_text(content):
+    """Text of a message for a person to read. The bridge sends very long messages with the
+    whole text in `formatted_body` and a short copy in `body` ending in `[...]`. Use the HTML
+    text only then; normal messages keep `body` (formatted_body also carries mention pills)."""
+    content = content or {}
+    body = content.get("body")
+    body = body if isinstance(body, str) else ""
+    fb = content.get("formatted_body")
+    if body.rstrip().endswith("[...]") and isinstance(fb, str):
+        full = _html_to_text(fb)
+        if len(full) > len(body):
+            return full
+    return body
 
 
 def _media_filename(event, index):
@@ -2554,8 +2619,8 @@ def _to_messages(token, portal_id, selected, window, *, transcribe, self_number,
         gone = eid in redacted or not (e.get("content") or {}) or \
             bool((e.get("unsigned") or {}).get("redacted_because"))
         newest = sorted(edits.get(eid, []), key=lambda x: x.get("origin_server_ts") or 0)
-        text = (((newest[-1].get("content") or {}).get("m.new_content") or {}).get("body", "")
-                if newest else (e.get("content") or {}).get("body", ""))
+        text = (_message_text((newest[-1].get("content") or {}).get("m.new_content"))
+                if newest else _message_text(e.get("content")))
         return S.ReplyRef(id=eid, text="" if gone else text, deleted=gone)
 
     out = []
@@ -2569,7 +2634,7 @@ def _to_messages(token, portal_id, selected, window, *, transcribe, self_number,
                         is_from_me=_is_owner(sender, self_number),
                         ts=(e.get("origin_server_ts") or 0) / 1000.0, deleted=deleted)
         if not deleted:
-            body = content.get("body", "") or ""
+            body = _message_text(content)
             msgtype = content.get("msgtype")
             if msgtype in MEDIA_MSGTYPES:
                 info = content.get("info") or {}
@@ -2604,7 +2669,7 @@ def _to_messages(token, portal_id, selected, window, *, transcribe, self_number,
             if history:
                 msg.edits = [S.Edit(ts=msg.ts, text=msg.text)] + [
                     S.Edit(ts=(x.get("origin_server_ts") or 0) / 1000.0,
-                           text=((x.get("content") or {}).get("m.new_content") or {}).get("body", ""))
+                           text=_message_text((x.get("content") or {}).get("m.new_content")))
                     for x in history]
                 msg.text = msg.edits[-1].text
             reply = (content.get("m.relates_to") or {}).get("m.in_reply_to") or {}
@@ -2913,7 +2978,7 @@ def cmd_history(args):
         ts = _format_ts(event.get("origin_server_ts", 0))
         sender = _sender_label(event.get("sender", "?"))
         content = event.get("content", {})
-        body = content.get("body", "")
+        body = _message_text(content)
         line = f"  [{ts}] {sender}: {body}"
         line += _voice_note_suffix(token, event, transcribe=transcribe)
         # --ids is opt-in: `comms` and the KB exporter parse the default line.
@@ -3003,7 +3068,7 @@ def cmd_groups(args):
             if event.get("type") == "m.room.message":
                 ts = event.get("origin_server_ts", 0)
                 sender = _sender_label(event.get("sender", "?"))
-                body = (event.get("content", {}).get("body", "") or "").replace("\n", " ").strip()
+                body = _message_text(event.get("content")).replace("\n", " ").strip()
                 body += _voice_note_suffix(token, event, transcribe=transcribe)
                 break
         groups.append((label, room_id, ts, sender, body))
@@ -3083,7 +3148,7 @@ def cmd_unread(args):
         body, ts, preview = "", 0, ""
         for event in reversed(room_data.get("timeline", {}).get("events", [])):
             if event.get("type") == "m.room.message":
-                body = event.get("content", {}).get("body", "")
+                body = _message_text(event.get("content"))
                 ts = event.get("origin_server_ts", 0)
                 # Voice notes: transcribe inline (default) so the preview isn't
                 # a blank/filename. Falls back to a placeholder, never crashes.
@@ -3354,7 +3419,7 @@ def _chat_unchanged_guard(token, portal_id, since):
         top = max(msgs, key=lambda e: e.get("origin_server_ts") or 0)
         ts = top.get("origin_server_ts") or 0
         print(f"  newest message here: [{_format_ts(ts)}] {_sender_label(top.get('sender', '?'))}: "
-              f"{_one_line(top.get('content', {}).get('body'), 80)}  (--since {ts / 1000:.3f})")
+              f"{_one_line(_message_text(top.get('content')), 80)}  (--since {ts / 1000:.3f})")
     else:
         print("  no message visible in this chat  (--since empty)")
     if since is None:
@@ -3370,7 +3435,7 @@ def _chat_unchanged_guard(token, portal_id, since):
         print(f"NOT SENT: {len(newer)} newer message(s) in this chat since the one you read:")
         for e in newer:
             print(f"  [{_format_ts(e.get('origin_server_ts'))}] {_sender_label(e.get('sender', '?'))}: "
-                  f"{_one_line(e.get('content', {}).get('body'), 200)}")
+                  f"{_one_line(_message_text(e.get('content')), 200)}")
         print("Re-read the chat, redraft, and get a fresh yes before sending.")
         sys.exit(STALE_EXIT)
 
@@ -3764,7 +3829,7 @@ def cmd_react(args):
             sys.exit(1)
     event_id = target["event_id"]
     content = target.get("content") or {}
-    body = content.get("body") or f"[{content.get('msgtype', 'message')}]"
+    body = _message_text(content) or f"[{content.get('msgtype', 'message')}]"
     who = "your" if _is_owner(target.get("sender"), self_number) \
         else f"{_sender_label(target.get('sender', '?'))}'s"
     where = f'GROUP "{chat["label"]}"' if chat["is_group"] else chat["label"]
@@ -3778,7 +3843,7 @@ def cmd_react(args):
         top = max(newer, key=lambda e: e.get("origin_server_ts") or 0)
         print(f"  note: {len(newer)} newer message(s) after this one. Newest: "
               f"{_sender_label(top.get('sender', '?'))}: "
-              f"{_one_line((top.get('content') or {}).get('body'), 80)}")
+              f"{_one_line(_message_text(top.get('content')), 80)}")
 
     try:
         relations = _request(
@@ -4370,7 +4435,7 @@ def _original_event(token, portal_id, ev, refuse):
 
 def _current_body(token, portal_id, original):
     """The text people see now: the newest edit by the same sender, else the original body."""
-    body = (original.get("content") or {}).get("body") or ""
+    body = _message_text(original.get("content"))
     try:
         chunk = _request(
             "GET", f"/_matrix/client/v1/rooms/{_encode_room(portal_id)}/relations/"
@@ -4382,7 +4447,7 @@ def _current_body(token, portal_id, original):
     if not mine:
         return body
     newest = max(mine, key=lambda e: e.get("origin_server_ts") or 0)
-    return ((newest.get("content") or {}).get("m.new_content") or {}).get("body") or body
+    return _message_text((newest.get("content") or {}).get("m.new_content")) or body
 
 
 def _own_tool_message(token, room, portal_id, event_id, refuse, verb):
@@ -4495,7 +4560,7 @@ def cmd_reply(args):
     else:
         print(f'About to send to {chat["label"]} [room {portal_id}]: "{message}"')
     print(f'  replying to {_sender_label(target.get("sender", "?"))}: '
-          f'"{_one_line((target.get("content") or {}).get("body"), 80)}"  [event {target["event_id"]}]')
+          f'"{_one_line(_message_text(target.get("content")), 80)}"  [event {target["event_id"]}]')
     _chat_unchanged_guard(token, portal_id, getattr(args, "since", None))
 
     content = {"msgtype": "m.text", "body": message,
@@ -4609,7 +4674,7 @@ def cmd_delete(args):
     if _is_redacted(orig):
         print("NOT DELETED: that message is already deleted. Nothing to do.")
         return
-    body = (orig.get("content") or {}).get("body") or f"[{(orig.get('content') or {}).get('msgtype')}]"
+    body = _message_text(orig.get("content")) or f"[{(orig.get('content') or {}).get('msgtype')}]"
     print(f'About to delete your message in {_where(chat)} [room {portal_id}]: '
           f'"{_one_line(body, 120)}"  [event {orig_id}]')
     locked = _admin_money_lock([body])
@@ -4689,7 +4754,7 @@ def cmd_mark_read(args):
             sys.exit(1)
         target = max(msgs, key=lambda e: e.get("origin_server_ts") or 0)
     event_id = target["event_id"]
-    body = (target.get("content") or {}).get("body") or ""
+    body = _message_text(target.get("content"))
     print(f'About to mark read {_where(chat)} [room {portal_id}] up to: '
           f'"{_one_line(body, 80)}"  [event {event_id}]')
     if not args.yes:
@@ -4714,7 +4779,7 @@ def cmd_mark_read(args):
 def _find_row(event, text_override=None):
     return {"ts": event.get("origin_server_ts") or 0, "sender": event.get("sender", "?"),
             "text": text_override if text_override is not None
-            else ((event.get("content") or {}).get("body") or ""), "edited": False,
+            else _message_text(event.get("content")), "edited": False,
             "room": event.get("room_id")}
 
 
@@ -4753,7 +4818,8 @@ def cmd_find(args):
         rel = (ev.get("content") or {}).get("m.relates_to") or {}
         if rel.get("rel_type") == "m.replace" and rel.get("event_id"):
             key = (ev.get("room_id"), rel["event_id"])
-            new_body = ((ev.get("content") or {}).get("m.new_content") or {}).get("body")
+            new_content = (ev.get("content") or {}).get("m.new_content") or {}
+            new_body = _message_text(new_content) if new_content.get("body") is not None else None
             row = rows.setdefault(key, _find_row(ev, new_body))
             edit_ts = ev.get("origin_server_ts") or 0
             if new_body is not None and edit_ts >= row.get("edit_ts", 0):
@@ -4778,7 +4844,7 @@ def cmd_find(args):
         for ev in events:
             if not _is_real_message(ev) or ev.get("event_id") in gone:
                 continue
-            body = (ev.get("content") or {}).get("body") or ""
+            body = _message_text(ev.get("content"))
             if needle in body.lower() and not ev.get("sender", "").startswith("@whatsappbot"):
                 row = _find_row(ev)
                 row["id"] = ev["event_id"]

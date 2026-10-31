@@ -203,6 +203,19 @@ def _report_send_result(resp: Any) -> None:
         )
 
 
+def _tls_context() -> ssl.SSLContext:
+    """Check the bridge's certificate, so someone on the same network cannot read the API key."""
+    if os.environ.get("SLACK_BRIDGE_INSECURE_TLS") == "1":
+        print("slack: TLS check is OFF (SLACK_BRIDGE_INSECURE_TLS=1). "
+              "Someone on your network can read your API key.", file=sys.stderr)
+        return ssl._create_unverified_context()
+    context = ssl.create_default_context()
+    # A python.org build on a Mac can start with no root certificates at all.
+    if not context.get_ca_certs() and os.path.exists("/etc/ssl/cert.pem"):
+        context.load_verify_locations("/etc/ssl/cert.pem")
+    return context
+
+
 def request_json(config: Config, path: str, params: dict[str, Any] | None = None, method: str = "GET", body: dict[str, Any] | None = None, timeout: int = 30) -> Any:
     url = f"{config.bridge_url}/{path.lstrip('/')}"
     if params:
@@ -214,8 +227,7 @@ def request_json(config: Config, path: str, params: dict[str, Any] | None = None
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    verify_tls = os.environ.get("SLACK_BRIDGE_VERIFY_TLS") == "1"
-    context = None if verify_tls else ssl._create_unverified_context()
+    context = _tls_context()
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, context=context, timeout=timeout) as response:
@@ -233,8 +245,7 @@ def download_file(config: Config, file_id: str, workspace: str | None, out_dir: 
     url = f"{config.bridge_url}/files/{urllib.parse.quote(file_id)}"
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    verify_tls = os.environ.get("SLACK_BRIDGE_VERIFY_TLS") == "1"
-    context = None if verify_tls else ssl._create_unverified_context()
+    context = _tls_context()
     req = urllib.request.Request(url, headers={"X-Api-Key": config.api_key})
     try:
         with urllib.request.urlopen(req, context=context, timeout=60) as response:
