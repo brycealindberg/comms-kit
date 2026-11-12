@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shlex
+import socket
 import ssl
 import subprocess
 import sys
@@ -129,13 +130,27 @@ def default_bridge_url(root: Path) -> str:
     return f"https://{hostname}{prefix}".rstrip("/")
 
 
+def _open_tunnel(url) -> str:
+    """url while something listens on its port, else "". A local tunnel to the bridge box, for a network that drops
+    or intercepts the direct route: it is used only while it is open."""
+    parts = urllib.parse.urlsplit(str(url or ""))
+    try:
+        socket.create_connection((parts.hostname, parts.port), timeout=0.3).close()
+    except (OSError, TypeError, ValueError):
+        return ""
+    return str(url).rstrip("/")
+
+
 def load_config() -> Config:
+    # A URL the caller set beats an open slack.tunnel_bridge_url; one the .env files below set does not.
+    caller_url = os.environ.get("SLACK_BRIDGE_URL") or os.environ.get("REMOTE_BRIDGE_URL")
     root = repo_root()
     bridge_dir = local_bridge_dir(root)
     load_env_file(bridge_dir / ".env")
     if root:
         load_env_file(root / ".env")
-    bridge_url = (os.environ.get("SLACK_BRIDGE_URL") or os.environ.get("REMOTE_BRIDGE_URL")
+    bridge_url = (caller_url or _open_tunnel(_conf("slack.tunnel_bridge_url"))
+                  or os.environ.get("SLACK_BRIDGE_URL") or os.environ.get("REMOTE_BRIDGE_URL")
                   or _conf("slack.bridge_url") or (default_bridge_url(root) if root else ""))
     if not bridge_url:
         raise SystemExit("slack: set slack.bridge_url in the kit config (or SLACK_BRIDGE_URL)")
@@ -381,12 +396,9 @@ def _gate_check(args: argparse.Namespace, *, target: str, texts: list[str], scop
                 hashes: list | None = None, dry_run: bool, source: str):
     """Outbound gate on the FINAL text. Enforce mode refusing -> exit 7, nothing sent."""
     G = _comms_module("outbound_gate")
-    if G is None:
-        if _gate_mode_fallback() == "enforce":
-            print("NOT SENT: outbound gate (enforce): the gate module could not load.")
-            raise SystemExit(GATE_DENY_EXIT)
-        sys.stderr.write("outbound gate: module could not load; report mode, continuing\n")
-        return None
+    if G is None:  # fails closed in EVERY mode: the gate holds hard checks (typed yes, 2026-11-02)
+        print("NOT SENT: outbound gate: the gate module could not load. Fix it, then send again.")
+        raise SystemExit(GATE_DENY_EXIT)
     approvals = G.Approvals.from_env(money_ok=bool(getattr(args, "money_ok", False)),
                                      override_reason=getattr(args, "override_check", None) or "",
                                      resend_ok=bool(getattr(args, "resend_ok", False)))
@@ -394,7 +406,11 @@ def _gate_check(args: argparse.Namespace, *, target: str, texts: list[str], scop
                                 thread=thread or "", filenames=list(filenames or []),
                                 attachment_texts=list(attachment_texts or []),
                                 unread_attachments=list(unread or []),
-                                attachment_hashes=[h for h in (hashes or []) if h])
+                                attachment_hashes=[h for h in (hashes or []) if h],
+                                # typed-yes check: the archive's name for this chat; only a DM
+                                # (D...) can block, a channel only logs (2026-11-02)
+                                labels=[G.archive_label("slack", target)],
+                                is_group=not str(target or "").upper().startswith("D"))
     verdict = G.evaluate(payload, approvals, dry_run=dry_run, source=source)
     if not verdict.allow:
         print(verdict.deny_line())
@@ -1383,7 +1399,9 @@ def handle(args: argparse.Namespace) -> None:
                 print("Re-run with --yes to upload.")
                 return
             op = _gate_begin(gate)
-            resp = _post(config, "/files/upload", body, gate, op, timeout=120)
+            # A fixed 120 s cut off a 14 MB body at this Mac's ~80 KB/s uplink (2026-11-02); allow 40 KB/s.
+            resp = _post(config, "/files/upload", body, gate, op,
+                         timeout=max(120, len(encoded) // 40_000 + 60))
             _report_send_result(resp)
             _log_send(args.channel, args.caption, resp, "upload", files=[path.name], workspace=args.workspace)
         case "threads":

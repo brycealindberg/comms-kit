@@ -1,0 +1,8 @@
+{
+  "instagram": {
+    "homeserver": "https://matrix.example.com",
+    "bot_user": "@instagrambot:matrix.example.com",
+    "daily_send_cap": 40,
+    "min_send_gap_seconds": 20
+  }
+}

@@ -146,6 +146,8 @@ class OutboundPayload:
     attachment_hashes: List[str] = field(default_factory=list)
     raw_texts: List[str] = field(default_factory=list)
     inspection_errors: List[str] = field(default_factory=list)
+    labels: List[str] = field(default_factory=list)        # names the CLI resolved + what was typed
+    is_group: Optional[bool] = None                        # None = the CLI does not know
 
     def all_words(self) -> List[str]:
         return list(self.texts) + list(self.filenames) + [t for _, t in self.attachment_texts]
@@ -168,17 +170,22 @@ class Verdict:
     blocking: List[Tuple[str, str]] = field(default_factory=list)
     findings: List[Tuple[str, str]] = field(default_factory=list)
     checks: Dict[str, str] = field(default_factory=dict)
+    hard: List[Tuple[str, str]] = field(default_factory=list)   # blocks in EVERY mode
 
     @property
     def allow(self) -> bool:
+        if self.hard:
+            return False
         return True if self.mode == "report" else self.would_allow
 
     def deny_line(self) -> str:
-        why = "; ".join("%s: %s" % (c, r) for c, r in self.blocking) or "a check could not run"
+        reasons = list(self.hard) + list(self.blocking)
+        why = "; ".join("%s: %s" % (c, r) for c, r in reasons) or "a check could not run"
         return "NOT SENT: outbound gate (%s): %s" % (self.mode, why)
 
     def to_dict(self) -> Dict[str, Any]:
         return {"mode": self.mode, "would_allow": self.would_allow, "allow": self.allow,
+                "hard": [list(h) for h in self.hard],
                 "blocking": [list(b) for b in self.blocking],
                 "findings": [list(f) for f in self.findings], "checks": dict(self.checks)}
 
@@ -406,18 +413,344 @@ def evaluate(p: OutboundPayload, approvals: Optional[Approvals] = None, *, dry_r
     steps = (("markup", lambda: _check_markup(p, v)),
              ("dev", lambda: _check_dev(p, a, v, source)),
              ("style", lambda: _check_style_and_money(p, a, v)),
-             ("dup", lambda: _check_dup(p, a, v)))
+             ("dup", lambda: _check_dup(p, a, v)),
+             ("dnc", lambda: _check_dnc(p, v)),
+             ("typed_yes", lambda: _check_typed_yes(p, v)))
     for name, step in steps:
         try:
             step()
         except Exception as e:  # noqa: BLE001 - a check that cannot run is an error, never a pass
             v.checks[name] = "error"
+            if name == "typed_yes":  # an odd transcript must not stop every send: record, never block
+                v.findings.append((name, "check could not run: %s" % snippet("%s: %s" % (e.__class__.__name__, e))))
+                continue
+            if name == "dnc":  # a safety list fails closed when it is on
+                why = "check could not run: %s" % snippet("%s: %s" % (e.__class__.__name__, e))
+                (v.hard if dnc_mode() == "block" else v.findings).append((name, why))
+                continue
             if name == "style":
                 v.checks["money"] = "error"
             v.blocking.append((name, "check could not run: %s" % snippet("%s: %s" % (e.__class__.__name__, e))))
-    v.would_allow = not v.blocking
+    v.would_allow = not v.blocking and not v.hard
     _audit(p, v, dry_run=dry_run, source=source)
     return v
+
+
+# ------------------------------------------------------------------ do-not-contact list
+#
+# outbound.dnc: "block" (a DM to a listed person blocks in EVERY mode, and a missing or broken list
+# blocks every send), "log" (hits are recorded only), "off" or unset (no check). outbound.dnc_file:
+# the list (default <archive>/do_not_contact.json). Names and aliases match whole words of the chat
+# label the sender resolved; handles match the target and the recipients. A group only logs: a name
+# in a group title does not show the person is in it, and LIDs hide members. An entry with
+# "mode": "log" only logs, for a name that may belong to someone else.
+
+DNC_MODES = ("block", "log", "off")
+
+
+def dnc_mode() -> str:
+    value = str(_kitconfig().get("outbound.dnc", "off") or "off").strip().lower()
+    return value if value in DNC_MODES else "block"
+
+
+def dnc_path() -> str:
+    return _kitconfig().path("outbound.dnc_file") or os.path.join(comms_dir(), "do_not_contact.json")
+
+
+def _whole_word(term: Any, text: Any) -> bool:
+    t = _fold(term).strip()
+    return bool(t) and re.search(r"(?<!\w)" + re.escape(t) + r"(?!\w)", _fold(text)) is not None
+
+
+def _handle_norm(value: Any) -> str:
+    h = str(value or "").strip().lower()
+    digits = re.sub(r"[\s()+.-]", "", h)
+    return digits if digits.isdigit() else h
+
+
+def _check_dnc(p: OutboundPayload, v: Verdict) -> None:
+    mode = dnc_mode()
+    if mode == "off":
+        v.checks["dnc"] = "off"
+        return
+    path = dnc_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            entries = json.load(fh)["entries"]
+        if not isinstance(entries, list):
+            raise TypeError("entries is not a list")
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        v.checks["dnc"] = "list error"
+        why = ("the do-not-contact list %s could not be read (%s). Restore it, then send again"
+               % (path, e.__class__.__name__))
+        (v.hard if mode == "block" else v.findings).append(("dnc", why))
+        return
+    labels = [str(x) for x in (p.labels or []) if str(x or "").strip()]
+    handles = {_handle_norm(x) for x in [p.target] + list(p.recipients or []) if str(x or "").strip()}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        terms = [entry.get("name")] + list(entry.get("aliases") or [])
+        by_name = any(t and _whole_word(t, label) for t in terms for label in labels)
+        listed = set()
+        for values in (entry.get("handles") or {}).values():
+            listed.update(_handle_norm(x) for x in (values or []) if str(x or "").strip())
+        if not by_name and not (listed & handles):
+            continue
+        why = ("%s is on the do-not-contact list (%s). Ask the owner"
+               % (entry.get("name") or "a listed person", entry.get("reason") or "no reason given"))
+        if p.is_group:
+            v.checks["dnc"] = "group"
+            v.findings.append(("dnc", why + " (group: logged only)"))
+        elif mode == "block" and str(entry.get("mode") or "block") != "log":
+            v.checks["dnc"] = "hit"
+            v.hard.append(("dnc", why))
+            return
+        else:
+            v.checks["dnc"] = "hit (log)"
+            v.findings.append(("dnc", why))
+    v.checks.setdefault("dnc", "clear")
+
+
+def dnc_lookup(labels: List[str]) -> Optional[str]:
+    """The listed name a chat label hits (names and aliases, whole words), or None."""
+    with open(dnc_path(), encoding="utf-8") as fh:
+        entries = json.load(fh)["entries"]
+    for entry in entries:
+        if isinstance(entry, dict):
+            terms = [entry.get("name")] + list(entry.get("aliases") or [])
+            if any(t and _whole_word(t, label) for t in terms for label in labels):
+                return str(entry.get("name"))
+    return None
+
+
+def dnc_add(name: str, aliases: List[str] = (), handles: Optional[Dict[str, List[str]]] = None,
+            reason: str = "", added_by: str = "") -> Dict[str, Any]:
+    """Add a person, or merge new aliases and handles into their entry. It never removes an entry,
+    a handle or an alias, and never rewrites a reason: only the owner removes (by hand for now).
+    A broken list raises and is left as it is."""
+    path = dnc_path()
+    os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+    with open(path + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            data = {"version": 1, "entries": []}
+        entries = data.setdefault("entries", [])
+        key = _fold(name).strip()
+        entry = next((e for e in entries if isinstance(e, dict) and _fold(e.get("name")).strip() == key), None)
+        if entry is None:
+            entry = {"name": name.strip(), "aliases": [], "handles": {}, "reason": reason.strip(),
+                     "added_by": added_by, "added": time.strftime("%Y-%m-%d")}
+            entries.append(entry)
+        have = entry.setdefault("aliases", [])
+        for alias in aliases or ():
+            if alias.strip() and _fold(alias).strip() not in [_fold(x).strip() for x in have] + [key]:
+                have.append(alias.strip())
+        for channel, values in (handles or {}).items():
+            listed = entry.setdefault("handles", {}).setdefault(channel, [])
+            for value in values or ():
+                norm = _handle_norm(value)
+                if norm and norm not in listed:
+                    listed.append(norm)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=1, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    return entry
+
+# ------------------------------------------------------------------ typed yes (the owner's own words)
+#
+# The 2026-11-02 case: the owner typed "Send it to <name>", the tool found no contact by that name,
+# and the agent sent to someone else. When the owner's last typed prompt names people after "to" in a sentence with a send
+# word, a DM must reach one of them. A mismatch is a HARD finding (blocks in every mode) when
+# outbound.typed_yes is "block"; "log" records it; "off" skips the check. Groups only log: a group
+# title does not show who is in it. No session, no transcript or no label: recorded, never blocked.
+
+TYPED_YES_MODES = ("block", "log", "off")
+TYPED_TAIL_BYTES = 4 * 1024 * 1024
+_SEND_WORD = re.compile(r"(?i)\b(?:send|sent|text|message|msg|reply|respond|forward|tell|dm|ping|"
+                        r"email|e-mail|post|share)\b")
+_NAME = r"[^\W\d_][\w'’-]*"
+_TO_NAMES = re.compile(r"\b[Tt]o\s+(" + _NAME + r")((?:\s*(?:,|&|\band\b)\s*" + _NAME + r")*)")
+_LIST_NAME = re.compile(_NAME)
+# Capitalized words after "to" that are not people. Lowercase words are never read as names.
+NOT_A_NAME = frozenset("""
+i me you him her us them it my your his our their this that these those everyone everybody anyone
+someone the a an all both each whatsapp slack email gmail mail upwork imessage imessages sms telegram
+linkedin instantly discord github clickup notion comms bot grok chatgpt claude codex loom
+monday tuesday wednesday thursday friday saturday sunday today tomorrow tonight january february
+march april may june july august september october november december dm dms channel group thread
+send sent text message msg reply respond forward tell ping post share done draft drafted approved
+""".split())
+# A pasted block is someone else's text (a draft, a relay, a log), not the owner's own words.
+_PASTE = re.compile(r"(?s)<pasted_content\b[^>]*>.*?(?:</pasted_content\b[^>]*>|\Z)")
+
+
+def _fold(text: str) -> str:
+    text = unicodedata.normalize("NFKD", str(text or ""))
+    return "".join(ch for ch in text if not unicodedata.combining(ch)).lower()
+
+
+def _clean_name(word: str) -> str:
+    word = re.sub(r"['’]s$", "", word)
+    return _fold(word).strip("'’-")
+
+
+def named_recipients(prompt: str) -> List[str]:
+    """People the prompt sends to: capitalized words after "to", in a sentence with a send word."""
+    names: List[str] = []
+    own = _PASTE.sub("\n", str(prompt or ""))
+    for sentence in re.split(r"[.!?\n]+", own):
+        if not _SEND_WORD.search(sentence):
+            continue
+        for m in _TO_NAMES.finditer(sentence):
+            words = [m.group(1)] + _LIST_NAME.findall(m.group(2) or "")
+            for w in words:
+                if w.lower() == "and" or not w[:1].isupper() or (len(w) > 1 and w.isupper()):
+                    continue  # lowercase = not a name; ALL CAPS = a status word ("to SENT")
+                name = _clean_name(w)
+                if len(name) >= 2 and name not in NOT_A_NAME and name not in names:
+                    names.append(name)
+    return names
+
+
+def _label_tokens(labels: List[str]) -> List[str]:
+    out: List[str] = []
+    for label in labels or []:
+        for tok in re.split(r"[^\w]+", _fold(label)):
+            if tok and not tok.isdigit() and tok not in ("wa", "dm") and tok not in out:
+                out.append(tok)
+    return out
+
+
+def names_match(named: List[str], labels: List[str]) -> bool:
+    """True when one named person is in the labels: same word, or one is a 3+ letter start of the other."""
+    tokens = _label_tokens(labels)
+    for n in named:
+        for t in tokens:
+            if n == t or (len(n) >= 3 and t.startswith(n)) or (len(t) >= 3 and n.startswith(t)):
+                return True
+    return False
+
+
+def archive_label(channel: str, target: str) -> str:
+    """The chat's name from the archive index (threads.json), or "" when it is not known.
+    For senders whose own resolver gives no name (Slack sends take a bare channel id)."""
+    try:
+        with open(os.path.join(comms_dir(), "threads.json"), encoding="utf-8") as fh:
+            rows = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    row = rows.get(str(target or "").strip().lower()) if isinstance(rows, dict) else None
+    if not isinstance(row, dict) or row.get("channel") != channel:
+        return ""
+    label = str(row.get("label") or "").strip()
+    return "" if label in ("None", "null") else label
+
+
+def typed_yes_mode() -> str:
+    value = str(_kitconfig().get("outbound.typed_yes", "block") or "block").strip().lower()
+    return value if value in TYPED_YES_MODES else "block"
+
+
+def _prompt_text(row: Dict[str, Any]) -> Optional[str]:
+    if row.get("type") != "user" or row.get("isSidechain"):
+        return None
+    # "queued" = typed while a turn was running; still the owner's own words (2026-11-07).
+    if (row.get("origin") or {}).get("kind") != "human" or row.get("promptSource") not in ("typed", "queued"):
+        return None
+    content = (row.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+        if parts and not any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+            return "\n".join(parts)
+    return None
+
+
+def transcript_path(session_id: str) -> Optional[str]:
+    root = _kitconfig().path("outbound.transcripts_dir") or os.path.join(_home(), ".claude", "projects")
+    if not session_id or not re.match(r"^[A-Za-z0-9-]{8,80}$", session_id):
+        return None
+    try:
+        folders = os.listdir(root)
+    except OSError:
+        return None
+    for folder in folders:
+        candidate = os.path.join(root, folder, session_id + ".jsonl")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def last_typed_prompt(path: str) -> Optional[str]:
+    """The newest prompt the owner typed in this session (main thread only), from the file's tail."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        if size > TYPED_TAIL_BYTES:
+            fh.seek(size - TYPED_TAIL_BYTES)
+            fh.readline()
+        lines = fh.read().splitlines()
+    for raw in reversed(lines):
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            text = _prompt_text(row)
+            if text is not None:
+                return text
+    return None
+
+
+def _check_typed_yes(p: OutboundPayload, v: Verdict) -> None:
+    mode = typed_yes_mode()
+    if mode == "off":
+        v.checks["typed_yes"] = "off"
+        return
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    if not session:
+        v.checks["typed_yes"] = "no session"
+        return
+    path = transcript_path(session)
+    if not path:
+        v.checks["typed_yes"] = "no transcript"
+        return
+    labels = [str(x) for x in (p.labels or []) if str(x or "").strip()]
+    if not labels:
+        v.checks["typed_yes"] = "no label"
+        return
+    prompt = last_typed_prompt(path)
+    if prompt is None:
+        v.checks["typed_yes"] = "no typed prompt"
+        return
+    named = named_recipients(prompt)
+    if not named:
+        v.checks["typed_yes"] = "no name"
+        return
+    if not _label_tokens(labels):  # a bare number: nothing to compare the name with
+        v.checks["typed_yes"] = "label has no name"
+        return
+    if names_match(named, labels):
+        v.checks["typed_yes"] = "match"
+        return
+    said = ", ".join(n.title() for n in named)
+    why = ("the owner's last typed prompt says to %s; this chat is %s. Ask him who he meant"
+           % (said, snippet(labels[0])))
+    if p.is_group:
+        v.checks["typed_yes"] = "group"
+        v.findings.append(("typed_yes", why + " (group: logged only)"))
+    elif mode == "block":
+        v.checks["typed_yes"] = "mismatch"
+        v.hard.append(("typed_yes", why))
+    else:
+        v.checks["typed_yes"] = "mismatch (log)"
+        v.findings.append(("typed_yes", why))
 
 
 # ------------------------------------------------------------------ reservation

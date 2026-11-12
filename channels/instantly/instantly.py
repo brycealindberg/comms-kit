@@ -339,12 +339,9 @@ def _gate_mode_fallback() -> str:
 
 def _gate_check(args, *, target, text, scope, thread, dry_run):
     G = _comms_module("outbound_gate")
-    if G is None:
-        if _gate_mode_fallback() == "enforce":
-            print("NOT SENT: outbound gate (enforce): the gate module could not load.")
-            raise SystemExit(GATE_DENY_EXIT)
-        sys.stderr.write("outbound gate: module could not load; report mode, continuing\n")
-        return None
+    if G is None:  # fails closed in EVERY mode: the gate holds hard checks (typed yes, 2026-11-02)
+        print("NOT SENT: outbound gate: the gate module could not load. Fix it, then send again.")
+        raise SystemExit(GATE_DENY_EXIT)
     approvals = G.Approvals.from_env(money_ok=bool(args.money_ok))
     payload = G.OutboundPayload("instantly", target=target, texts=[text], recipients=[target],
                                 scope=scope or "", thread=thread or "")

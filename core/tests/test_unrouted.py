@@ -65,6 +65,19 @@ class Unrouted(unittest.TestCase):
         self.assertEqual(len(rows), 1, out)
         return rows[0]
 
+    def test_routing_rules_print_with_the_list(self):
+        # 2026-11-01: the SessionStart note went down to 3 lines, so the filing rules live here,
+        # where they are read right before a route. Losing them = one client's words filed
+        # in another client's folder. This file is mirrored into the public comms-kit repo,
+        # so the output must name no private path or person.
+        self.write({"a@x.example.com": thread("a@x.example.com")})
+        out = self.run_cli()
+        self.assertIn("comms route <target> <project> --path /abs/repo", out)
+        self.assertIn("comms thread <target>", out)
+        self.assertIn("name the contact to the user and ask", out)
+        self.assertNotIn("/Users/", out)
+        self.assertNotIn("Bry" "ce", out)  # split: the kit scrub blocks the name itself
+
     def test_folder_from_note_is_shown(self):
         self.write({"a@x.example.com": thread("a@x.example.com")},
                    note=HEADER + "| `a@x.example.com` | gmail | /Users/you/Desktop/projects/acme app |\n")

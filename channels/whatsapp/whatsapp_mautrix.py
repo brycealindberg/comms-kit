@@ -93,6 +93,7 @@ import mimetypes
 import tempfile
 import array
 import wave
+import socket
 import ssl
 import subprocess
 import argparse
@@ -160,6 +161,8 @@ def _read_settings():
             "voice_env_file": kitconfig.get("whatsapp.voice_env_file", ""),
             "voice_background": kitconfig.get("whatsapp.voice_background", ""),
             "owner_lid": kitconfig.get("whatsapp.owner_lid", ""),
+            "tunnel_homeserver": kitconfig.get("whatsapp.tunnel_homeserver", ""),
+            "tunnel_whisper": kitconfig.get("whatsapp.tunnel_whisper", ""),
         }
     except kitconfig.ConfigError:
         return {}
@@ -211,10 +214,25 @@ def tts_speakable(text: str) -> str:
 
 # --- Config / constants -------------------------------------------------------
 
-# The homeserver comes from MATRIX_HOMESERVER_URL, else `whatsapp.homeserver`. When both are
-# empty, the first request stops with one line naming the missing key (see _homeserver).
+# The homeserver comes from MATRIX_HOMESERVER_URL, else an open `whatsapp.tunnel_homeserver`
+# (then whisper uses `whatsapp.tunnel_whisper`), else `whatsapp.homeserver`. When none is set,
+# the first request stops with one line naming the missing key (see _homeserver).
 DEFAULT_HOMESERVER = str(_SETTINGS.get("homeserver", "")).strip()
-HOMESERVER_URL = os.environ.get("MATRIX_HOMESERVER_URL", DEFAULT_HOMESERVER).rstrip("/")
+
+
+def _open_tunnel(url):
+    """url while something listens on its port, else "". whatsapp.tunnel_homeserver can name a local tunnel to the
+    bridge box, for a network that drops or intercepts the direct route; it is used only while it is open."""
+    parts = urllib.parse.urlsplit(str(url or ""))
+    try:
+        socket.create_connection((parts.hostname, parts.port), timeout=0.3).close()
+    except (OSError, TypeError, ValueError):
+        return ""
+    return str(url).rstrip("/")
+
+
+TUNNEL_URL = "" if "MATRIX_HOMESERVER_URL" in os.environ else _open_tunnel(_SETTINGS.get("tunnel_homeserver"))
+HOMESERVER_URL = os.environ.get("MATRIX_HOMESERVER_URL", TUNNEL_URL or DEFAULT_HOMESERVER).rstrip("/")
 
 
 def _homeserver():
@@ -247,7 +265,7 @@ def _default_whisper_url(homeserver_url):
 # WHISPER_URL env overrides; else derive from the effective homeserver context
 # so the box (localhost) and the Mac (Tailscale) both work with no config.
 WHISPER_URL = os.environ.get(
-    "WHISPER_URL", _default_whisper_url(HOMESERVER_URL)
+    "WHISPER_URL", (TUNNEL_URL and str(_SETTINGS.get("tunnel_whisper") or "")) or _default_whisper_url(HOMESERVER_URL)
 ).rstrip("/")
 
 BOT_USER = str(_SETTINGS.get("bot_user", "")).strip()  # the bridge bot's Matrix id
@@ -1084,8 +1102,8 @@ def _resolve_chat(token, mgmt_room, identifier):
          `create-portal` in the MANAGEMENT room, then parsed + joined. Classified
          via `_is_group`.
       3a. An exact saved contact (`comms contact add`) -> DM to that number.
-      3. Otherwise (a NAME) -> case-insensitive substring match against joined
-         portal names. EXACTLY one match -> use it directly (groups AND already-
+      3. Otherwise (a NAME) -> word match (whole word, or a 3+ letter word start)
+         against joined portal names. EXACTLY one match -> use it directly (groups AND already-
          materialized DMs). ZERO -> fall back to the DM `search` flow (resolve to
          one number, start-chat). MULTIPLE -> print candidates and EXIT non-zero.
     """
@@ -1130,10 +1148,10 @@ def _resolve_chat(token, mgmt_room, identifier):
         portal_id = _resolve_portal(token, mgmt_room, saved)
         return {"portal_id": portal_id, "label": f"{saved} ({identifier})", "is_group": False}
 
-    # Branch 3: a NAME -> substring-match joined portals (case-insensitive).
-    needle = identifier.lower()
+    # Branch 3: a NAME -> word match on joined portals (whole word, or a 3+ letter word start;
+    # never mid-word: "Ali" is not "Natali"). Was a substring match until 2026-11-02.
     matches = [(rid, name) for rid, name in _joined_portals(token, mgmt_room)
-               if name and needle in name.lower()]
+               if name and _name_word_match(identifier, name)]
     if len(matches) == 1:
         portal_id, name = matches[0]
         _join_portal(token, portal_id)
@@ -2440,17 +2458,13 @@ def _gate_recipients(token, portal_id, chat, identifier):
 
 
 def _gate_check(args, *, target, texts, recipients, filenames=(), attachment_texts=(),
-                unread=(), hashes=(), dry_run, source):
-    """Evaluate the outbound gate on the FINAL text. Exits GATE_DENY_EXIT in enforce mode when
-    it refuses. Returns a context for _gate_begin, or None when the gate could not load in
-    report mode."""
+                unread=(), hashes=(), labels=(), is_group=None, dry_run, source):
+    """Evaluate the outbound gate on the FINAL text. Exits GATE_DENY_EXIT when it refuses.
+    Returns a context for _gate_begin. A gate that cannot load blocks in every mode."""
     G = _comms_module("outbound_gate")
-    if G is None:
-        if _gate_mode_fallback() == "enforce":
-            print("NOT SENT: outbound gate (enforce): the gate module could not load.")
-            sys.exit(GATE_DENY_EXIT)
-        sys.stderr.write("outbound gate: module could not load; report mode, continuing\n")
-        return None
+    if G is None:  # fails closed in EVERY mode: the gate holds hard checks (typed yes, 2026-11-02)
+        print("NOT SENT: outbound gate: the gate module could not load. Fix it, then send again.")
+        sys.exit(GATE_DENY_EXIT)
     approvals = G.Approvals.from_env(
         money_ok=bool(getattr(args, "money_ok", False)),
         override_reason=(getattr(args, "override_check", None) or ""),
@@ -2458,7 +2472,10 @@ def _gate_check(args, *, target, texts, recipients, filenames=(), attachment_tex
     payload = G.OutboundPayload(
         "whatsapp", target=target, texts=list(texts), recipients=list(recipients),
         filenames=list(filenames), attachment_texts=list(attachment_texts),
-        unread_attachments=list(unread), attachment_hashes=[h for h in hashes if h])
+        unread_attachments=list(unread), attachment_hashes=[h for h in hashes if h],
+        # Names the RESOLVER found, never the typed identifier: the typed-yes check compares
+        # the owner's words with these, so the agent's own words must not count as proof.
+        labels=[str(x) for x in labels if x], is_group=is_group)
     verdict = G.evaluate(payload, approvals, dry_run=dry_run, source=source)
     if not verdict.allow:
         print(verdict.deny_line())
@@ -3200,7 +3217,27 @@ def _resolve_number(token, room, identifier):
         sys.exit(1)
 
     number, display = results[0]
+    if any(ch.isalpha() for ch in identifier) and not _name_word_match(identifier, display):
+        print(f"The only contact hit for '{identifier}' is '{display or number}', which does not "
+              f"match that name. Refusing to send. Pass the exact number if that person is right.")
+        sys.exit(1)
     return number, display
+
+
+def _fold_name(text):
+    import unicodedata  # noqa: PLC0415
+    text = unicodedata.normalize("NFKD", str(text or ""))
+    return "".join(ch for ch in text if not unicodedata.combining(ch)).lower().strip()
+
+
+def _name_word_match(needle, name):
+    """True when the typed name is a whole word (or words) of the chat name, or, with 3+
+    letters, the start of a word. Never the middle of a word: "Ali" does not hit "Natali"."""
+    n, h = _fold_name(needle), _fold_name(name)
+    if not n:
+        return False
+    tail = "" if len(n) >= 3 else r"(?!\w)"
+    return re.search(r"(?<!\w)" + re.escape(n) + tail, h) is not None
 
 
 # --- @mention resolution (READ-ONLY GET of the target room's own members) ------
@@ -3571,6 +3608,7 @@ def cmd_send(args):
     # Outbound gate on the FINAL text (P0). Report mode never changes this output or exit code.
     gate = _gate_check(args, target=portal_id, texts=[content.get("body", message)],
                        recipients=_gate_recipients(token, portal_id, chat, args.identifier),
+                       labels=[chat["label"]], is_group=bool(chat["is_group"]),
                        dry_run=not args.yes, source="whatsapp send")
 
     if not args.yes:
@@ -4065,6 +4103,7 @@ def cmd_send_media(args):
     file_text = G.readable_bytes(media_bytes) if G else None
     gate = _gate_check(args, target=portal_id, texts=[caption] if has_caption else [],
                        recipients=_gate_recipients(token, portal_id, chat, args.identifier),
+                       labels=[chat["label"]], is_group=bool(chat["is_group"]),
                        filenames=[filename],
                        attachment_texts=[(filename, file_text)] if file_text else [],
                        unread=[] if file_text else [filename],
@@ -4190,7 +4229,9 @@ def cmd_send_voice_confirm(args):
     if not args.yes:
         _gate_check(args, target=manifest["target"]["portal_id"],
                     texts=[part.get("text", "") for part in pending],
-                    recipients=[], dry_run=True, source="whatsapp send-voice-confirm preview")
+                    recipients=[], labels=[manifest["target"].get("label") or ""],
+                    is_group=bool(manifest["target"].get("is_group")),
+                    dry_run=True, source="whatsapp send-voice-confirm preview")
         print(
             "\nDry run — nothing sent. After listening and explicit approval, "
             "rerun this command with --yes."
@@ -4220,6 +4261,8 @@ def cmd_send_voice_confirm(args):
                        texts=[part.get("text", "") for part in pending],
                        recipients=_gate_recipients(token, portal_id, current_target,
                                                    manifest["recipient_input"]),
+                       labels=[current_target.get("label") or ""],
+                       is_group=bool(current_target.get("is_group")),
                        dry_run=False, source="whatsapp send-voice-confirm")
     print(
         "\nSending the approved cached audio exactly as previewed. "
@@ -4567,6 +4610,7 @@ def cmd_reply(args):
                "m.relates_to": {"m.in_reply_to": {"event_id": target["event_id"]}}}
     gate = _gate_check(args, target=portal_id, texts=[message],
                        recipients=_gate_recipients(token, portal_id, chat, args.identifier),
+                       labels=[chat["label"]], is_group=bool(chat["is_group"]),
                        dry_run=not args.yes, source="whatsapp reply")
     if not args.yes:
         print("Dry run — pass --yes to actually send.")
@@ -4628,6 +4672,7 @@ def cmd_edit(args):
                "m.relates_to": {"rel_type": "m.replace", "event_id": orig_id}}
     gate = _gate_check(args, target=portal_id, texts=[new],
                        recipients=_gate_recipients(token, portal_id, chat, args.identifier),
+                       labels=[chat["label"]], is_group=bool(chat["is_group"]),
                        dry_run=not args.yes, source="whatsapp edit")
     if not args.yes:
         print("Dry run — pass --yes (with --since from the line above) to edit.")

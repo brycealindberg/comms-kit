@@ -574,7 +574,13 @@ def cmd_unrouted(a):
             str(t.get("target"))[:34], t.get("channel", ""),
             t.get("count", 0), (t.get("last_et") or "")[:16],
             seen.get(t.get("target"), ""))).rstrip())
-    print("\nroute one with:  comms route <target> <project> --path /abs/repo")
+    # The SessionStart note points here, so the filing rules print here (moved 2026-11-01).
+    # This file is mirrored into the public comms-kit repo: no private path or name here.
+    print("\nroute one with:  comms route <target> <project> --path /abs/repo --label \"<human name>\"")
+    print("Two signals settle most of these: the SEEN FROM folder above usually names the client repo, "
+          "and `comms thread <target>` names the room (lines like `About to send to GROUP \"X\" [room !Y]`).")
+    print("Route it yourself when both signals agree. When they do not, name the contact to the user and ask: "
+          "a wrong route files one client's words in another client's folder.")
 
 
 _UNROUTED_ROW = re.compile(r"^\|\s*`([^`]+)`\s*\|([^|]*)\|([^|]*)\|")
@@ -966,6 +972,12 @@ def _reindex(a):
             good.append([r, raw])
             kept += 1
             k = r.get("target")
+            if not isinstance(k, str) or not k.strip():
+                # A row with no target (a 2026-09 Slack test sent to "   ")
+                # is KEPT in the store, but it names no conversation. A None
+                # key here made `_save`'s sort_keys raise and killed every
+                # rebuild after it (tests/test_reindex_targetless_row.py).
+                continue
             t = threads.setdefault(k, {"target": k, "channel": r.get("channel"),
                                        "count": 0, "first_et": r.get("et")})
             t["count"] += 1
@@ -2954,6 +2966,58 @@ def _add_contact_parser():
 
 
 _add_contact_parser()
+
+
+def _add_dnc_parser():
+    """`comms dnc` (do-not-contact list) lives in outbound_gate.py. A bad import there loses only
+    this subcommand. There is no remove on purpose: only the owner takes a person off the list."""
+    try:
+        import outbound_gate as gate
+    except BaseException as error:
+        sys.stderr.write("comms: dnc is unavailable: %s\n" % error)
+        return
+    channels = ("whatsapp", "imessage", "email", "slack", "upwork", "linkedin")
+
+    def run_add(a):
+        handles = {ch: getattr(a, ch) for ch in channels if getattr(a, ch)}
+        who = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        entry = gate.dnc_add(a.name, aliases=a.alias, handles=handles, reason=a.reason or "",
+                             added_by=("session " + who[:8]) if who else "comms cli")
+        print("on the do-not-contact list: %s (aliases %d, handles %d) in %s" % (
+            entry["name"], len(entry.get("aliases") or []),
+            sum(len(v) for v in (entry.get("handles") or {}).values()), gate.dnc_path()))
+
+    def run_list(a):
+        with open(gate.dnc_path(), encoding="utf-8") as fh:
+            entries = json.load(fh)["entries"]
+        for e in entries:
+            print("%-14s aliases=%-24s handles=%d  %s" % (
+                e.get("name"), ",".join(e.get("aliases") or []) or "-",
+                sum(len(v) for v in (e.get("handles") or {}).values()), e.get("reason") or ""))
+        print("%d people. mode=%s  file=%s" % (len(entries), gate.dnc_mode(), gate.dnc_path()))
+
+    def run_check(a):
+        hit = gate.dnc_lookup([a.label])
+        print(("HIT: %r is on the do-not-contact list as %s" % (a.label, hit)) if hit
+              else "clear: %r matches nobody on the list" % a.label)
+        sys.exit(1 if hit else 0)
+
+    d = sub.add_parser("dnc", help="do-not-contact list: add a person, list it, check a chat name")
+    ds = d.add_subparsers(dest="dnc_cmd", required=True)
+    add = ds.add_parser("add", help="add a person, or add aliases/handles to their entry")
+    add.add_argument("name")
+    add.add_argument("--alias", action="append", default=[])
+    for ch in channels:
+        add.add_argument("--" + ch, action="append", default=[], metavar="HANDLE")
+    add.add_argument("--reason", default="")
+    add.set_defaults(fn=run_add)
+    ds.add_parser("list", help="names, aliases, handle counts, mode").set_defaults(fn=run_list)
+    chk = ds.add_parser("check", help="does this chat name hit the list? exit 1 on a hit")
+    chk.add_argument("label")
+    chk.set_defaults(fn=run_check)
+
+
+_add_dnc_parser()
 
 sub.add_parser("routes", help="list contact -> project map").set_defaults(
     fn=cmd_routes)

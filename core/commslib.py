@@ -2987,6 +2987,17 @@ REDACTIONS = (
                 r"|glpat-[A-Za-z0-9_-]{16,}"
                 r"|A(?:KIA|SIA|ROA|IDA|GPA|IPA|NPA|CCA)[0-9A-Z]{16})\b"),
      "[REDACTED-KEY]"),
+    # A vendor key pasted bare: `<vendor>_<random>`, e.g. `boat_<64 chars>` or Stripe's
+    # `sk_live_` / `rk_test_` (2026-11-03: a boat.dev key reached a handoff note). The body must
+    # mix a digit, an upper and a lower letter, with no `_` inside it, so snake_case names, hex
+    # ids and dated file names (`2026-11-03_ci_report.html`) stay as they are. 32+ chars and a
+    # free-standing start (space, quote, `=`, `:`) keep Stripe/Vercel object ids (`price_`,
+    # `dpl_`, 24-28 chars) and the token inside a Stripe invoice link (`/i/acct_.../live_...`):
+    # a scan of 3,199 local files on 2026-11-03 matched only the leaked key.
+    (re.compile(r"(?<![^\s\"'`(=:,])[a-z][a-z0-9]{1,11}_(?:(?:live|test|prod)_)?"
+                r"(?=[A-Za-z0-9-]*\d)(?=[A-Za-z0-9-]*[A-Z])(?=[A-Za-z0-9-]*[a-z])"
+                r"[A-Za-z0-9-]{32,}(?![A-Za-z0-9_-])"),
+     "[REDACTED-KEY]"),
     # a JWT is three base64url segments; `eyJ` is base64 for `{"`
     (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
                 r"\.[A-Za-z0-9_-]{8,}\b"), "[REDACTED-JWT]"),

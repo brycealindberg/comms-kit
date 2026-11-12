@@ -33,6 +33,13 @@
     ],
     "session_path": "~/.config/comms-kit/telegram.session"
   },
+  "instagram": {
+    "homeserver": "https://matrix.example.com",
+    "tunnel_homeserver": "",
+    "bot_user": "@instagrambot:matrix.example.com",
+    "daily_send_cap": 40,
+    "min_send_gap_seconds": 20
+  },
   "gchat": {
     "gws_account": ""
   },
@@ -46,6 +53,7 @@
   },
   "slack": {
     "bridge_url": "https://bridge.example.com/slack",
+    "tunnel_bridge_url": "",
     "ssh_host": "my-bridge-server",
     "vps_bridge_dir": "/srv/slack-bridge",
     "repo_root": "~/path/to/private-workspace-with-env-and-guards",
@@ -57,6 +65,8 @@
   },
   "whatsapp": {
     "homeserver": "https://matrix.example.com",
+    "tunnel_homeserver": "",
+    "tunnel_whisper": "",
     "bot_user": "@whatsappbot:matrix.example.com",
     "contact_names_command": "ssh matrix.example.com \"sqlite3 -readonly -json /path/to/mautrix-whatsapp.db \\\"SELECT their_jid AS jid, full_name AS name, 'synced' AS source FROM whatsmeow_contacts WHERE full_name <> ''\\\"\"",
     "matrix_user": "owner",
@@ -74,7 +84,11 @@
   },
   "outbound": {
     "dev_guard": "/path/to/your/dev_guard.py",
-    "dev_ok_env": []
+    "dev_ok_env": [],
+    "dnc": "off",
+    "dnc_file": "~/.local/share/comms-kit/do_not_contact.json",
+    "typed_yes": "block",
+    "transcripts_dir": "~/.claude/projects"
   },
   "_external_keys": [
     "data_dir",

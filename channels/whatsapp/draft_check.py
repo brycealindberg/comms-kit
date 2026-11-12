@@ -24,6 +24,10 @@ BUDGETS = {
     "slack-dm": CHAT,
     "slack-public": CHAT,
     "upwork": CHAT,
+    "instagram": CHAT,
+    "telegram": CHAT,
+    "gchat": CHAT,
+    "chatwoot": CHAT,
     "gmail": (1, 20000),
     "instantly": (1, 20000),
 }

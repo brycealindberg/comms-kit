@@ -182,7 +182,7 @@ class GateCheck(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 result = CS.gate_check(lambda name: gate, lambda: mode, "chan", True, target="t", text="hi",
-                                       scope="s", thread="th", dry_run=False, source="x send")
+                                       scope="s", thread="th", dry_run=False, source="x send", **kw)
             except SystemExit as e:
                 return e.code, out.getvalue(), err.getvalue(), None
         return 0, out.getvalue(), err.getvalue(), result
@@ -199,6 +199,39 @@ class GateCheck(unittest.TestCase):
         self.assertEqual((dry_run, source), (False, "x send"))
         self.assertIs(ctx[0], gate)
 
+    def test_labels_and_group_reach_a_gate_that_has_them_without_blanks(self):
+        gate = FakeGate()
+        code, _, _, _ = self.check(gate, labels=["Alex Doe", "", None, "alex"], is_group=False)
+        self.assertEqual(code, 0)
+        payload = gate.evaluated[0][0]
+        self.assertEqual(payload.kw["labels"], ["Alex Doe", "alex"])
+        self.assertIs(payload.kw["is_group"], False)
+
+    def test_no_labels_given_means_no_labels_field(self):
+        gate = FakeGate()
+        self.check(gate)
+        self.assertNotIn("labels", gate.evaluated[0][0].kw)
+        self.assertNotIn("is_group", gate.evaluated[0][0].kw)
+
+    def test_an_older_gate_without_labels_still_gets_the_payload(self):
+        import dataclasses
+
+        @dataclasses.dataclass
+        class OldPayload:  # the gate before labels / is_group existed
+            channel: str
+            target: str
+            texts: list
+            recipients: list
+            scope: str = ""
+            thread: str = ""
+
+        gate = FakeGate()
+        gate.OutboundPayload = OldPayload
+        code, _, _, _ = self.check(gate, labels=["Alex Doe"], is_group=True)
+        self.assertEqual(code, 0)
+        payload = gate.evaluated[0][0]
+        self.assertEqual((payload.target, payload.texts), ("t", ["hi"]))
+
     def test_a_refusal_exits_7_and_prints_the_deny_line(self):
         code, out, _, ctx = self.check(FakeGate(allow=False))
         self.assertEqual(code, 7)
@@ -209,11 +242,13 @@ class GateCheck(unittest.TestCase):
         self.assertEqual(code, 7)
         self.assertIn("NOT SENT", out)
 
-    def test_unloadable_gate_in_report_mode_continues_with_a_warning(self):
-        code, _, err, ctx = self.check(None, mode="report")
-        self.assertEqual(code, 0)
-        self.assertIsNone(ctx)
-        self.assertIn("could not load", err)
+    def test_unloadable_gate_in_report_mode_exits_7(self):
+        # The gate holds hard checks (typed yes, do-not-contact) that block in every mode, so a
+        # gate that cannot load must not let a plug-in channel send in report mode (2026-11-12).
+        code, out, _, _ = self.check(None, mode="report")
+        self.assertEqual(code, 7)
+        self.assertIn("NOT SENT", out)
+        self.assertIn("could not load", out)
 
 
 class GateBeginFinish(unittest.TestCase):

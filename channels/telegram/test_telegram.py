@@ -271,6 +271,14 @@ class SendGuards(Base):
         self.assertEqual(code, 7)
         self.assertEqual(self.client.writes(), [])
 
+    def test_gate_that_cannot_load_in_report_mode_sends_nothing(self):
+        # the gate's hard checks (typed yes, do-not-contact) block in every mode, so no gate = no send
+        with mock.patch.object(T, "_comms_module", lambda name: None), \
+                mock.patch.object(T, "_gate_mode_fallback", lambda: "report"):
+            code, _, _ = self.send("--yes")
+        self.assertEqual(code, 7)
+        self.assertEqual(self.client.writes(), [])
+
 
 class SendResults(Base):
     def test_send_writes_exactly_one_archive_row(self):
@@ -505,12 +513,14 @@ class Credentials(unittest.TestCase):
         # the credentials reach only the client factory; no verb prints them
         client = FakeClient()
         out, err = io.StringIO(), io.StringIO()
+        # A gate that cannot load blocks in every mode (2026-11-12), so the send gets an allowing fake gate.
+        mods = {"outbound_gate": FakeGate(), "commslib": FakeComms()}
         with mock.patch.object(T, "make_client", lambda: client), \
-                mock.patch.object(T, "_comms_module", lambda name: None), \
-                mock.patch.object(T, "_gate_mode_fallback", lambda: "report"), \
+                mock.patch.object(T, "_comms_module", lambda name: mods.get(name)), \
                 mock.patch.object(T, "_money_hits", lambda text: []), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             T.main(["send", CHAT, "hello there", "--since", str(T_OLD), "--yes"])
+        self.assertEqual(len(client.writes()), 1, "the send must really run, or this test proves nothing")
         self.assertNotIn(SECRET, out.getvalue() + err.getvalue())
 
 

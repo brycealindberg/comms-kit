@@ -1,10 +1,10 @@
 # comms-kit
 
-Command-line tools for your own messages on Gmail, WhatsApp, Slack, iMessage, Instantly, Telegram, Google Chat and Chatwoot, plus phone-call transcripts and one searchable archive of everything you sent, read and said on a call. They are built for AI coding agents and for people at a terminal.
+Command-line tools for your own messages on Gmail, WhatsApp, Slack, iMessage, Instagram, Instantly, Telegram, Google Chat and Chatwoot, plus phone-call transcripts and one searchable archive of everything you sent, read and said on a call. They are built for AI coding agents and for people at a terminal.
 
 Each channel is one folder. Use only the ones you want. Add a new one with no change to the core: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-**Telegram, Google Chat and Chatwoot are mock only.** That code has never run against a real account. See [What was tested](#what-was-tested-and-what-was-not).
+**Instagram is new: its code ran only on a fake Matrix server so far.** **Telegram, Google Chat and Chatwoot are mock only.** That code has never run against a real account. See [What was tested](#what-was-tested-and-what-was-not).
 
 > **Read [Terms of service and ban risk](#terms-of-service-and-ban-risk) first.** Some of these channels do not use an official API. Your account can be restricted or banned, and that risk is yours.
 
@@ -20,6 +20,7 @@ This table comes from each channel's `channel.json`. `tools/capabilities.py --ch
 | gchat | `spaces`, `history`, `find` | `send`, `reply` | `mark-read` | - |
 | gmail | `+read`, `+triage`, `+watch`, `messages.get`, `messages.list`, `threads.get`, `threads.list`, `history.list`, `drafts.get`, `drafts.list` | `+send`, `+reply`, `+reply-all`, `+forward`, `messages.send`, `drafts.send` | `messages.import`, `messages.insert`, `drafts.create`, `drafts.update` | - |
 | imessage | `chats`, `resolve`, `history`, `search`, `whois`, `stats` | `send`, `send-preview` | `doctor`, `prepare-send`, `show-preview`, `discard-preview` | `reply-quote`, `tapback`, `edit`, `unsend`, `mark-read`, `group-admin`, `block` |
+| instagram | `chats`, `unread`, `history`, `find`, `download` | `send`, `reply`, `send-media`, `react`, `edit` | `delete`, `mark-read`, `clear-hold` | - |
 | instantly | `unread`, `thread`, `find` | `reply` | `mark-read` | - |
 | slack | `channels`, `contacts`, `history`, `threads`, `files`, `download`, `transcribe`, `transcribe-channel`, `find`, `mentions`, `open-dm`, `channel-members` | `send`, `upload`, `react`, `edit`, `delete`, `channel-create`, `channel-invite`, `channel-remove`, `channel-rename`, `channel-archive`, `channel-leave` | - | `mark-read`, `block` |
 | telegram | `chats`, `unread`, `history`, `find` | `send`, `reply` | `mark-read` | - |
@@ -103,6 +104,7 @@ You alone are responsible for how you use these tools. Read each service's terms
 | Instantly | Instantly's official API | Official. A reply reaches a real lead from a real mailbox. |
 | iMessage | [openclaw/imsg](https://github.com/openclaw/imsg) on your own Mac. It reads the local Messages database. | Apple has no public API for this. It needs Full Disk Access, which gives the terminal app access to much more than messages. |
 | **WhatsApp** | A Matrix server with the unofficial [mautrix-whatsapp](https://github.com/mautrix/whatsapp) bridge, as a linked device | **Unofficial. WhatsApp's terms do not allow unofficial clients, and WhatsApp can ban the number.** You run the server, and it holds your messages. |
+| **Instagram** | A Matrix server with the unofficial mautrix-instagram bridge (it lives in [mautrix/meta](https://github.com/mautrix/meta)), logged in as you. It does not use Meta's official API. | **Unofficial. Instagram's terms do not allow unofficial clients, and Instagram can warn, restrict or close the account.** The CLI stops every write when the bridge login is not healthy, sets a 24 hour send hold when Instagram refuses a send with words that point to a limit, and has a daily cap and a minimum gap. Log in from an IP address the account already uses (a home proxy, for example), not from a data center. You run the server, and it holds your messages. |
 | **Slack** | A bridge that uses your **browser session**: an `xoxc` token and the `d` cookie. `auth.js` opens Chrome, you sign in, and it reads both. They are stored encrypted in the bridge's `config.json`. | **Not an official Slack app. It acts as you, with your full access.** It can break your workspace's rules or Slack's terms. Ask the workspace owner first. An admin can see the session. |
 | Telegram | A user account over MTProto, through the optional Telethon library. Mock only. | Telegram can limit or ban an account for automated use, even on its own API. Use an account you can lose, and keep volume low. |
 | Google Chat | Google's own Chat API, through the `gws` tool. Mock only. | Low. It needs a Google Workspace login with the Chat scope. A personal Gmail account is refused (exit 3). |
@@ -111,7 +113,7 @@ You alone are responsible for how you use these tools. Read each service's terms
 
 **Recording a call is your legal duty.** Some places need consent from everyone on the call. Say at the start that you record. This is not legal advice.
 
-mautrix-whatsapp is AGPL. This kit only talks to it over the network and holds none of its code.
+mautrix-whatsapp and mautrix-instagram are AGPL. This kit only talks to them over the network and holds none of their code.
 
 ## What was tested, and what was not
 
@@ -123,6 +125,7 @@ The core, WhatsApp, Slack and Instantly files are the same bytes the maintainer 
 | Slack | Send, edit, delete, react, search, mentions, a file upload and a thread reply, in the maintainer's own DM. A private channel's create, rename and archive, in the maintainer's own workspace. | Invite, remove, opening a new DM. A real leave: Slack refuses the last member, so that test proved only the refusal. | |
 | iMessage | The same wrapper's text, file and audio file sends, in the maintainer's own chat | This repo's copy, which runs only on a fake runtime | |
 | Gmail | Read and send on one account. Google contact save and delete. | Several accounts, on an isolated folder | A real second-account login |
+| Instagram | | All verbs, on a fake Matrix server | **Any real login** |
 | Instantly | Unread, thread and search | Reply, mark read | |
 | Calls | Notes audio transcripts, litepipe meetings, the whisper request with a synthetic clip | Quo, on a mock | A real Call Recordings folder, a real Quo account |
 | Telegram | | All verbs, on a fake client | **Any real login** |
@@ -144,6 +147,11 @@ Each step ends with `comms doctor`.
 1. Run a Matrix server with mautrix-whatsapp, and link your phone.
 2. Set the `whatsapp.*` keys from `channels/whatsapp/config.example.json`.
 3. Optional: set `whatsapp.contact_names_command` so `comms contact wa-check` can read the names your phone synced to the bridge.
+
+**Instagram**
+1. Run a Matrix server with mautrix-instagram. Check the bridge before you install it: `python3 tools/bridge_scan.py --help`.
+2. Set the `instagram.*` keys from `channels/instagram/config.example.json`.
+3. Run `python3 channels/instagram/instagram.py setup --token-file FILE`, then `login`. Only you type the password. [channels/instagram/README.md](channels/instagram/README.md) has the steps.
 
 **Slack**
 1. `cd channels/slack/bridge && npm ci`. Signing in needs Node 22.12 or newer.

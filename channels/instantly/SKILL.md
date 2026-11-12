@@ -1,6 +1,6 @@
 ---
 name: instantly
-description: Use when reading or replying to cold-email lead replies on Instantly (the Unibox): unread replies, a thread, a search, a reply, or marking a thread read.
+description: "Use when reading or replying to cold-email lead replies on Instantly (the Unibox): unread replies, a thread, a search, a reply, or marking a thread read."
 ---
 
 # Instantly

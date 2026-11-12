@@ -64,6 +64,22 @@ class Budget(unittest.TestCase):
                      "instantly"):
             self.assertIn(name, dc.BUDGETS)
 
+    def test_every_plug_in_channel_that_calls_the_gate_has_a_budget(self):
+        # Without one the gate's style check cannot run: enforce mode then refuses every send on that
+        # channel, and report mode lets it out with no size check.
+        import glob
+        import re
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        names = set()
+        for path in glob.glob(os.path.join(root, "*", "*.py")):
+            if os.path.basename(path).startswith("test_"):
+                continue
+            with open(path, encoding="utf-8") as fh:
+                names |= set(re.findall(r'gate_check\(_comms_module, _gate_mode_fallback, "([a-z-]+)"', fh.read()))
+        self.assertTrue(names, "no plug-in channel found; the pattern is stale")
+        for name in sorted(names):
+            self.assertIn(name, dc.BUDGETS, f"{name} calls the gate but has no draft_check budget")
+
     def test_the_cap_itself_is_allowed_and_one_past_it_is_not(self):
         max_bubbles, max_chars = dc.BUDGETS["whatsapp"]
         at_cap = [(f"b{i}", "x") for i in range(max_bubbles)]

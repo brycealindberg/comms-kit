@@ -1,0 +1,25 @@
+{
+  "name": "instagram",
+  "entry": "instagram.py",
+  "kind": "python-cli",
+  "verbs": {
+    "chats": {"direction": "read"},
+    "unread": {"direction": "read"},
+    "history": {"direction": "read"},
+    "find": {"direction": "read"},
+    "download": {"direction": "read"},
+    "send": {"direction": "send", "dry_run_unless_yes": true},
+    "reply": {"direction": "send", "dry_run_unless_yes": true},
+    "send-media": {"direction": "send", "dry_run_unless_yes": true},
+    "react": {"direction": "send", "dry_run_unless_yes": true},
+    "edit": {"direction": "send", "dry_run_unless_yes": true},
+    "delete": {"direction": "none", "dry_run_unless_yes": true},
+    "mark-read": {"direction": "none", "dry_run_unless_yes": true},
+    "clear-hold": {"direction": "none", "dry_run_unless_yes": true}
+  },
+  "ignored": ["login", "status", "setup"],
+  "blocked": {},
+  "config_keys": ["instagram.homeserver", "instagram.bot_user", "instagram.daily_send_cap",
+                  "instagram.min_send_gap_seconds"],
+  "requires": ["python3", "a Matrix server with the mautrix-instagram bridge (github.com/mautrix/meta)"]
+}

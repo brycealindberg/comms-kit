@@ -121,19 +121,30 @@ def gate_mode_fallback():
     return value if value in ("report", "enforce") else "enforce"
 
 
-def gate_check(load, mode_fallback, channel, money_ok, *, target, text, scope, thread, dry_run, source):
-    """Ask the outbound gate. Returns (gate, payload, approvals), or None when the gate cannot load
-    in report mode. Exits 7 on a refusal, or when the gate cannot load in enforce mode."""
+def gate_check(load, mode_fallback, channel, money_ok, *, target, text, scope, thread, dry_run, source,
+               labels=(), is_group=None):
+    """Ask the outbound gate. Returns (gate, payload, approvals). Exits 7 on a refusal, or when the
+    gate cannot load, in EVERY mode: the gate holds hard checks (typed yes, do-not-contact) that block
+    even in report mode (2026-11-12). mode_fallback is no longer read; it stays so callers keep working.
+
+    labels: the chat names the CLI resolved plus what was typed (the typed-yes and do-not-contact
+    checks read them). is_group: True/False when the CLI knows. A gate that has no such fields yet
+    gets the payload without them."""
     G = load("outbound_gate")
     if G is None:
-        if mode_fallback() == "enforce":
-            print("NOT SENT: outbound gate (enforce): the gate module could not load.")
-            raise SystemExit(GATE_DENY_EXIT)
-        sys.stderr.write("outbound gate: module could not load; report mode, continuing\n")
-        return None
+        print("NOT SENT: outbound gate: the gate module could not load. Fix it, then send again.")
+        raise SystemExit(GATE_DENY_EXIT)
     approvals = G.Approvals.from_env(money_ok=bool(money_ok))
-    payload = G.OutboundPayload(channel, target=target, texts=[text], recipients=[target],
-                                scope=scope or "", thread=thread or "")
+    base = dict(target=target, texts=[text], recipients=[target], scope=scope or "", thread=thread or "")
+    extra = {}
+    if labels:
+        extra["labels"] = [str(x) for x in labels if str(x or "").strip()]
+    if is_group is not None:
+        extra["is_group"] = bool(is_group)
+    try:
+        payload = G.OutboundPayload(channel, **base, **extra)
+    except TypeError:  # an older gate without labels / is_group
+        payload = G.OutboundPayload(channel, **base)
     verdict = G.evaluate(payload, approvals, dry_run=dry_run, source=source)
     if not verdict.allow:
         print(verdict.deny_line())
